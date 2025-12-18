@@ -6,29 +6,32 @@ import torch
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 
+class TaskSubset(Dataset):
+    def __init__(self, base_dataset, selected_indices):
+        self.base_dataset = base_dataset
+        self.selected_indices = selected_indices
 
+    def __len__(self):
+        return len(self.selected_indices)
+
+    def __getitem__(self, i):
+        return self.base_dataset[self.selected_indices[i]][0]
 class MultiCropDataset(Dataset):
     def __init__(
         self,
-        data_path,
         size_crops,
         nmb_crops,
         min_scale_crops,
         max_scale_crops,
         size_dataset=-1,
+        CICL = False,
         return_index=False,
         train=True,
         download=True,
     ):
-        """
-        CIFAR-100 版本的 MultiCropDataset：
-        - 从 data_path 读取 CIFAR-100
-        - 图像原始大小 32x32
-        - 通过 RandomResizedCrop 直接采样为 224 / 96 等尺寸（相当于 upsample）
-        - 使用与 ImageNet SwAV 相同的增广策略
-        """
+         
         super().__init__()
-
+        self.CICL = CICL
         # === 1) 底层数据集：CIFAR-100 ===
         self.dataset = datasets.CIFAR100(
             root='./',
@@ -79,14 +82,17 @@ class MultiCropDataset(Dataset):
 
     def __getitem__(self, index):
         real_idx = self.indices[index]
-        image, _ = self.dataset[real_idx]   # image 是 PIL.Image
+        image, label = self.dataset[real_idx]   # image 是 PIL.Image
 
         # 按多 crop transform 生成 N 个视图
         multi_crops = [trans(image) for trans in self.trans]
 
         if self.return_index:
             return real_idx, multi_crops
-        return multi_crops
+        if self.CICL:
+            return multi_crops,label
+        else:
+            return multi_crops
 
 
 class PILRandomGaussianBlur(object):

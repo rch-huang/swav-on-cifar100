@@ -173,11 +173,11 @@ class ResNet(nn.Module):
         # change padding 3 -> 2 compared to original torchvision code because added a padding layer
         num_out_filters = width_per_group * widen
         self.conv1 = nn.Conv2d(
-            3, num_out_filters, kernel_size=7, stride=2, padding=2, bias=False
+            3, num_out_filters, kernel_size=3, stride=1, padding=1, bias=False
         )
         self.bn1 = norm_layer(num_out_filters)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.maxpool =nn.Identity()# nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         self.layer1 = self._make_layer(block, num_out_filters, layers[0])
         num_out_filters *= 2
         self.layer2 = self._make_layer(
@@ -300,11 +300,11 @@ class ResNet(nn.Module):
 
         if self.l2norm:
             x = nn.functional.normalize(x, dim=1, p=2)
-
+            #x = x * 5.0  # scale feature norms to 5 as in the paper
         if self.prototypes is not None:
             return x, self.prototypes(x)
         return x
-
+    
     def forward(self, inputs):
         if not isinstance(inputs, list):
             inputs = [inputs]
@@ -314,6 +314,9 @@ class ResNet(nn.Module):
         )[1], 0)
         start_idx = 0
         for end_idx in idx_crops:
+            #[0:2]
+            #[2:6]
+            #for 2 crops of size 128 and 4 crops of size 64
             _out = self.forward_backbone(torch.cat(inputs[start_idx: end_idx]).cuda(non_blocking=True))
             if start_idx == 0:
                 output = _out
@@ -337,10 +340,16 @@ class MultiPrototypes(nn.Module):
         return out
 
 
-def resnet50(**kwargs):
+def resnet50_(**kwargs):
     return ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
 
-
+def resnet50(**kwargs):
+    """
+    Standard ResNet-18 backbone with SwAV head.
+    Usage: --arch resnet18
+    """
+    model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
+    return model
 def resnet50w2(**kwargs):
     return ResNet(Bottleneck, [3, 4, 6, 3], widen=2, **kwargs)
 
