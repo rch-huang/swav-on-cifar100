@@ -56,7 +56,7 @@ parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=True)
 #### optim parameters ###
 #########################
 parser.add_argument("--epochs", default=100, type=int)
-parser.add_argument("--batch_size", default=256, type=int)
+parser.add_argument("--batch_size", default=64, type=int)
 parser.add_argument("--base_lr", default=0.05, type=float)
 parser.add_argument("--final_lr", type=float, default=0)
 parser.add_argument("--freeze_prototypes_niters", default=0, type=int)
