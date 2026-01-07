@@ -21,7 +21,7 @@ from src.utils import (
     fix_random_seeds,
     AverageMeter,
 )
-from src.multicropcifar100 import MultiCropDataset
+from src.multicropcifar100 import MultiCropDataset, TaskSubset
 import src.resnet50 as resnet_models
 datestamp = time.strftime("%Y%m%d%H%M%S")
 
@@ -36,20 +36,20 @@ parser.add_argument("--data_path", type=str, default="/path/to/imagenet",
                     help="path to dataset repository")
 parser.add_argument("--nmb_crops", type=int, default=[2,4], nargs="+")
 parser.add_argument("--size_crops", type=int, default=[128,64], nargs="+")
-parser.add_argument("--min_scale_crops", type=float, default=[0.3,0.05], nargs="+")
-parser.add_argument("--max_scale_crops", type=float, default=[1.0,0.3], nargs="+")
+parser.add_argument("--min_scale_crops", type=float, default=[0.14,0.2], nargs="+")
+parser.add_argument("--max_scale_crops", type=float, default=[1.0,0.4], nargs="+")
 
 #########################
 ## swav specific params #
 #########################
 parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0])
 parser.add_argument("--temperature", default=0.1, type=float)
-parser.add_argument("--epsilon", default=0.03, type=float)
+parser.add_argument("--epsilon", default=0.05, type=float)
 parser.add_argument("--sinkhorn_iterations", default=3, type=int)
 parser.add_argument("--feat_dim", default=128, type=int)
-parser.add_argument("--nmb_prototypes", default=1000, type=int)
-parser.add_argument("--queue_length", type=int, default=4096)
-parser.add_argument("--epoch_queue_starts", type=int, default=2)
+parser.add_argument("--nmb_prototypes", default=250, type=int)
+parser.add_argument("--queue_length", type=int, default=1000)
+parser.add_argument("--epoch_queue_starts", type=int, default=0)
 
 #########################
 #### optim parameters ###
@@ -68,7 +68,7 @@ parser.add_argument("--start_warmup", default=0, type=float)
 #########################
 parser.add_argument("--arch", default="resnet50", type=str)
 parser.add_argument("--hidden_mlp", default=2048, type=int)
-parser.add_argument("--workers", default=8, type=int)
+parser.add_argument("--workers", default=0, type=int)
 parser.add_argument("--checkpoint_freq", type=int, default=25)
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
@@ -81,7 +81,7 @@ def extract_train_features(model, train_loader, device='cuda'):
     with torch.no_grad():
         for x, y in train_loader:
             x = x.to(device)
-            f,_ = model(x)     
+            f,_ = model(x)     # 你要确保 model forward 输出的是 feature, not logits
             feats.append(f.cpu())
             labels.append(y)
 
@@ -125,13 +125,16 @@ def auto_bins_by_quantile(counts, n_bins=10,epoch=-1,logfile='train_log.txt'):
 
     counts_np = np.array(counts)
 
+    # 自动根据 quantile 生成区间边界
     quantiles = np.linspace(0, 1, n_bins + 1)
     bin_edges = np.quantile(counts_np, quantiles)
 
+    # 避免出现重复边界（比如全 0）
     bin_edges = np.unique(bin_edges)
 
     print("\n=== Prototype Usage Distribution by Quantile Bins ===")
 
+    # 统计每个区间的数量
     for i in range(len(bin_edges) - 1):
         low = bin_edges[i]
         high = bin_edges[i + 1]
@@ -206,6 +209,14 @@ def get_knneval_epoch_from_switch(_datestamp):
                     print(  e)
                     return []
 def build_probe_loader(args):
+    """
+    从训练集里固定抽取一小部分样本（默认 512），
+    用一个**确定性**的弱增广（类似 test_transform）来做 probe。
+
+    注意：
+    - shuffle=False，保证每个 epoch 样本顺序一致，
+    - transform 没有随机性（Resize + CenterCrop），保证同一张图每次 crop 一致。
+    """
     import torchvision.transforms as transforms
     import torchvision.datasets as datasets
     from torch.utils.data import DataLoader, Subset
@@ -216,9 +227,9 @@ def build_probe_loader(args):
         transforms.CenterCrop(96),
         transforms.ToTensor(),
     ])
-     
-    
-    base_dataset = datasets.CIFAR100(
+
+    if True:
+        base_dataset = datasets.CIFAR100(
             root='./',
             train=True,
             transform=probe_transform,
@@ -227,6 +238,7 @@ def build_probe_loader(args):
 
     num_samples = min(512, len(base_dataset))
 
+    # 用 seed 固定下来这一批样本
     g = torch.Generator()
     g.manual_seed(args.seed + 1234)
     indices = torch.randperm(len(base_dataset), generator=g)[:num_samples]
@@ -236,7 +248,7 @@ def build_probe_loader(args):
     probe_loader = DataLoader(
         probe_dataset,
         batch_size=args.batch_size,
-        shuffle=False,              
+        shuffle=False,              # 很重要：保证每个 epoch 顺序一致
         num_workers=args.workers,
         pin_memory=True,
     )
@@ -277,6 +289,16 @@ def get_save_epoch_from_switch(_filepath):
   
 @torch.no_grad()
 def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
+    """
+    使用固定的 probe_loader 计算：
+      1) KL(Q || P)，其中 P 是 softmax(logits) 得到的 prototype similarity 分布
+      2) KL(Q_t || Q_{t-1})，其中 Q_t 来自当前 epoch 的 Sinkhorn，Q_{t-1} 来自上一 epoch
+
+    返回：
+      - kl_q_p:      标量，KL(Q || P)
+      - kl_q_t_prev: 标量，KL(Q_t || Q_{t-1})，如果 prev_Q 为空则为 NaN
+      - Q_all:       当前 epoch probe 样本对应的 Q_t (N_probe x K) 用于下一个 epoch
+    """
     import torch
     import torch.nn.functional as F
 
@@ -287,10 +309,14 @@ def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
 
     for inputs, _ in probe_loader:
         inputs = inputs.to(device, non_blocking=True)
+        # forward: 与 extract_train_features 一样，单 view 前向
         feats, logits = model(inputs)   # logits: [B, K]
 
+        # P: prototype similarity 的 softmax 分布
+        #   这里直接对 logits softmax，就相当于用 "prototype scores" 归一化
         P = F.softmax(logits, dim=1)    # [B, K]
 
+        # Q: 用和训练时相同的 Sinkhorn 算法（但不使用 queue）
         Q = distributed_sinkhorn(logits)  # [B, K]
 
         all_P.append(P)
@@ -303,8 +329,8 @@ def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
     P_clamped = P_all.clamp(min=eps)
     Q_clamped = Q_all.clamp(min=eps)
 
-    sanity_check = False
-    if sanity_check:
+
+    if False:
           
           
         row_P = P_all.sum(dim=1)
@@ -346,6 +372,7 @@ def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
         kl_q_t_prev = torch.tensor(float("nan"), device=device)
 
     model.train()
+    # 返回两个 scalar + 当前的 Q_all，方便外面保存
     return kl_q_p.item(), kl_q_t_prev.item(), Q_all.detach().cpu()
 
 def main():
@@ -371,14 +398,50 @@ def main():
         args.min_scale_crops,
         args.max_scale_crops,
     )
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,            
-        num_workers=args.workers,
-        pin_memory=True,
-        drop_last=True,
-    )
+    train_loaders = []
+    train_loader = None
+    CICL = False
+    if CICL:
+        full_labels = np.array(train_dataset.dataset.targets)  # shape=(50000,)
+
+        num_tasks = 10
+        classes_per_task = 10
+
+        task_class_lists = [
+            list(range(t * classes_per_task, (t + 1) * classes_per_task))
+            for t in range(num_tasks)
+        ]
+        task_indices_list = []
+
+        for class_list in task_class_lists:
+            mask = np.isin(full_labels, class_list)
+            indices = np.where(mask)[0]
+            task_indices_list.append(indices)
+        
+         
+
+        for t, indices in enumerate(task_indices_list):
+            subset = TaskSubset(train_dataset, indices)
+            loader = torch.utils.data.DataLoader(
+                subset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.workers,
+                pin_memory=True,
+                drop_last=True,
+            )
+            train_loaders.append(loader)
+            print(f"Task {t}: classes {task_class_lists[t]}, samples={len(indices)}")
+    else:
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,            
+            num_workers=args.workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        train_loaders.append(train_loader)
     biggest_crop = args.size_crops[0]
     test_transform = torchvision.transforms.Compose([
        torchvision.transforms.Resize(biggest_crop),
@@ -741,6 +804,9 @@ def train(train_loader, model, optimizer,scaler, epoch, lr_schedule, queue,logfi
 
 @torch.no_grad()
 def distributed_sinkhorn(out):
+    """
+    单机单卡版 Sinkhorn-Knopp，不再使用 torch.distributed
+    """
     Q = torch.exp(out / args.epsilon).t()   # K x B
     B = Q.shape[1]
     K = Q.shape[0]

@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 from logging import getLogger
+import hashlib
 
 import numpy as np
 import torch
@@ -42,13 +43,14 @@ parser.add_argument("--max_scale_crops", type=float, default=[1.0 ], nargs="+")
 ## swav specific params #
 #########################
 parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0])
-parser.add_argument("--temperature", default=0.4, type=float)
-parser.add_argument("--epsilon", default=0.01, type=float)
+parser.add_argument("--temperature", default=0.1, type=float)
+parser.add_argument("--epsilon", default=0.005, type=float)
 parser.add_argument("--sinkhorn_iterations", default=10, type=int)
 parser.add_argument("--feat_dim", default=128, type=int)
 parser.add_argument("--nmb_prototypes", default=250, type=int)
-parser.add_argument("--queue_length", type=int, default=512)
+parser.add_argument("--queue_length", type=int, default=0)
 parser.add_argument("--epoch_queue_starts", type=int, default=5)
+parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=True)
 
 #########################
 #### optim parameters ###
@@ -57,7 +59,7 @@ parser.add_argument("--epochs", default=100, type=int)
 parser.add_argument("--batch_size", default=256, type=int)
 parser.add_argument("--base_lr", default=0.05, type=float)
 parser.add_argument("--final_lr", type=float, default=0)
-parser.add_argument("--freeze_prototypes_niters", default=5000, type=int)
+parser.add_argument("--freeze_prototypes_niters", default=0, type=int)
 parser.add_argument("--wd", default=1e-6, type=float)
 parser.add_argument("--warmup_epochs", default=10, type=int)
 parser.add_argument("--start_warmup", default=0, type=float)
@@ -72,6 +74,33 @@ parser.add_argument("--workers", default=0, type=int)
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
 parser.add_argument("--seed", type=int, default=30)
+parser.add_argument("--clamp_min", type=float, default=-80.0)
+class SinkhornTracker:
+    """
+    Track critical statistics for Sinkhorn normalization degeneracy (B-type).
+    No logging inside, only keeps running minima.
+    """
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.min_row_sum = float("inf")
+        self.min_col_sum = float("inf")
+
+    @torch.no_grad()
+    def update(self, Q):
+        # Q: [K, B] inside distributed_sinkhorn
+        row_sum = Q.sum(dim=1)   # [K]
+        col_sum = Q.sum(dim=0)   # [B]
+
+        rmin = row_sum.min().item()
+        cmin = col_sum.min().item()
+
+        if rmin < self.min_row_sum:
+            self.min_row_sum = rmin
+        if cmin < self.min_col_sum:
+            self.min_col_sum = cmin
+
 def extract_train_features(model, train_loader, seen_classes,device='cuda'):
     model.eval()
     feats = []
@@ -301,7 +330,7 @@ def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
 
         
         P = F.softmax(logits, dim=1)    # [B, K]
-
+ 
         
         Q = distributed_sinkhorn(logits)  # [B, K]
 
@@ -366,9 +395,9 @@ def main():
     global args
     args = parser.parse_args()
     with open("knn_switch_"+datestamp, 'w') as f:
-        f.write("epoch: [0,3,5,10]\n")
+        f.write("epoch: [3,30,60,90,99]\n")
         f.write(args.__repr__()+"\n")
-        f.write("save_epoch: [3,10]\n")
+        f.write("save_epoch: [50,99]\n")
         print("file name is knn_switch_"+datestamp)
     
     args.rank = 0
@@ -376,7 +405,6 @@ def main():
 
     fix_random_seeds(args.seed)
     logger_, training_stats = initialize_exp(args, "epoch", "loss")
-
     # ============ build data ============
     train_dataset = MultiCropDataset(
          
@@ -404,6 +432,10 @@ def main():
             list(all_classes[t*classes_per_task : (t+1)*classes_per_task])
             for t in range(num_tasks)
         ]
+        if False:
+             
+            task_class_lists[1] = task_class_lists[0]
+            
         task_indices_list = []
 
         for class_list in task_class_lists:
@@ -493,12 +525,20 @@ def main():
     )
 
     logfile = 'train_log_'+datestamp
+    with open(logfile, 'a') as f:
+        f.write(args.__repr__()+"\n")
     model = model.cuda()
     logger.info(model)
     logger.info("Building model done.")
     seen_classes = []
     knn_accs = []
-    for  task_number in range(len(train_loaders)):
+    for _task_number in range(len(train_loaders)):
+        task_number = _task_number
+        if False:
+            if _task_number == 0:
+                task_number = 1
+            elif _task_number ==1:
+                task_number = 0
         train_loader = train_loaders[task_number]
         seen_classes.append(task_class_lists[task_number])
         print(f"Starting training on task {task_number} with classes {task_class_lists[task_number]}...")
@@ -542,15 +582,22 @@ def main():
         
 
         # ============ build the queue ============
-        queue = None
+        if args.queue_cleared_each_task:
+            queue  = None
+        else:
+            if _task_number == 0:
+                queue = None
         
         
         args.queue_length -= args.queue_length % args.batch_size
 
         cudnn.benchmark = True
-        
-        
+        sinkhorn_tracker = SinkhornTracker()
+
+
         for epoch in range(0, args.epochs):
+            proto_hash_ref = tensor_hash(model.prototypes.weight.detach())
+
             if epoch in get_knneval_epoch_from_switch(datestamp) or 0 in get_knneval_epoch_from_switch(datestamp):
                 for classes_task_ind in range(len(seen_classes)):
                     task_classes = seen_classes[classes_task_ind]
@@ -568,7 +615,7 @@ def main():
             # REMOVED: train_loader.sampler.set_epoch(epoch)
 
             # optionally starts a queue
-            if args.queue_length > 0 and epoch >= args.epoch_queue_starts and task_number == 0 and queue is None:
+            if args.queue_length > 0 and epoch >= args.epoch_queue_starts and queue is None:# and _task_number == 0:
                 queue = torch.zeros(
                     len(args.crops_for_assign),
                     args.queue_length,
@@ -581,11 +628,22 @@ def main():
                                         optimizer,
                                         scaler,
                                         task_number,
+                                        _task_number,
                                         epoch,
                                         lr_schedule,
                                         queue,
-                                        logfile=logfile)
+                                        logfile=logfile,
+                                        sinkhorn_tracker = sinkhorn_tracker)
             training_stats.update(scores)
+            with open(logfile, 'a') as f:
+                f.write(
+                    f"[SinkhornTracker][Epoch {epoch}], min_row_sum={sinkhorn_tracker.min_row_sum:.3e}, min_col_sum={sinkhorn_tracker.min_col_sum:.3e}"
+                )
+            logger.info(
+                f"[SinkhornTracker][Epoch {epoch}] "
+                f"min_row_sum={sinkhorn_tracker.min_row_sum:.3e}, "
+                f"min_col_sum={sinkhorn_tracker.min_col_sum:.3e}"
+            )
             kl_q_p, kl_q_t_prev, probe_Q_prev = compute_probe_kl(
                 model,
                 probe_loader,
@@ -618,6 +676,10 @@ def main():
                     path,
                 )
             
+
+            proto_hash_now = tensor_hash(model.prototypes.weight.detach())
+            logger.info(f"[Proto Hash] {proto_hash_ref} -> {proto_hash_now}")
+
             # save_dict = {
             #     "epoch": epoch + 1,
             #     "state_dict": model.state_dict(),
@@ -639,9 +701,10 @@ def main():
 
             # if queue is not None:
             #     torch.save({"queue": queue}, queue_path)
-
+def tensor_hash(x):
+    return hashlib.md5(x.cpu().numpy().tobytes()).hexdigest()
 from torch.amp import autocast, GradScaler
-def train(train_loader, model, optimizer,scaler,task, epoch, lr_schedule, queue,logfile='train_log.txt'):
+def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, queue,logfile='train_log.txt',sinkhorn_tracker=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -680,37 +743,172 @@ def train(train_loader, model, optimizer,scaler,task, epoch, lr_schedule, queue,
                 for i, crop_id in enumerate(args.crops_for_assign):
                     with torch.no_grad():
                         out = output[bs * crop_id: bs * (crop_id + 1)].detach()
+                        check_tensor("out(before_queue)", out, logger)
+
                         if it % 10 == 0 :
                              
-                            logit_std = out.std(dim=1).mean().item ()   
-                            logit_abs_mean = out.abs().mean().item()
-                            logger.info(
-                                f"[Debug] logits std per sample: {logit_std:.4f}, "
-                                f"abs mean: {logit_abs_mean:.4f}"
-                            )
+                            # logit_std = out.std(dim=1).mean().item ()   
+                            # logit_abs_mean = out.abs().mean().item()
+                            # logger.info(
+                            #     f"[Debug] logits std per sample: {logit_std:.4f}, "
+                            #     f"abs mean: {logit_abs_mean:.4f}"
+                            # )
+                            logger.info(f"[Debug] out stats: {tensor_stats(out)}")
                             with open(logfile, 'a') as f:
                                 f.write(
-                                    f"Task {task} Epoch {epoch} Iter {it} Logit std per sample: {logit_std:.4f}, "
-                                    f"abs mean: {logit_abs_mean:.4f}\n"
+                                    f"[Debug] out stats: {tensor_stats(out)}\n"
                                 )
                         if queue is not None:
                             if use_the_queue or not torch.all(queue[i, -1, :] == 0):
                                 use_the_queue = True
-                                out = torch.cat((
-                                    torch.mm(queue[i], model.prototypes.weight.t()),
-                                    out,
-                                ))
+                                # out = torch.cat((
+                                #     torch.mm(queue[i], model.prototypes.weight.t()),
+                                #     out,
+                                # ))
+                                mm_part = torch.mm(queue[i], model.prototypes.weight.t())
+                                check_tensor("queue[i]", queue[i], logger)
+                                check_tensor("prototypes.weight", model.prototypes.weight, logger)
+                                check_tensor("mm_part(queue·W^T)", mm_part, logger)
+                                mm_max = mm_part.max().item()
+                                mm_min = mm_part.min().item()
+                                batch_max = out.max().item()
+                                batch_min = out.min().item()
+
+                                logger.info(
+                                    f"[OutSource] mm_part: min={mm_min:.4f}, max={mm_max:.4f} | "
+                                    f"batch_out: min={batch_min:.4f}, max={batch_max:.4f}"
+                                )
+                                with open(logfile, 'a') as f:
+                                    f.write(
+                                        f"[OutSource] mm_part: min={mm_min:.4f}, max={mm_max:.4f} | batch_out: min={batch_min:.4f}, max={batch_max:.4f}\n"
+                                    ) 
+                                out = torch.cat((mm_part, out))
+
                             nmb_crops = np.sum(args.nmb_crops)
                             embedding = embedding.view(nmb_crops, bs, -1).contiguous()
                             crop_emb = embedding[crop_id]
                             queue[i, bs:] = queue[i, :-bs].clone()
                             #queue[i, :bs] = embedding[crop_id * bs: (crop_id + 1) * bs]
                             queue[i, :bs] = crop_emb
-                        q = distributed_sinkhorn(out)[-bs:]
+                        
+                        # check_tensor("out(before_sinkhorn)", out, logger)
+                        # q = distributed_sinkhorn(out)[-bs:]
+                        # check_tensor("Q(after_sinkhorn)", q, logger)
+
+                        check_tensor("out(before_sinkhorn)", out, logger)
+                        if sinkhorn_tracker != None:
+                            sinkhorn_tracker.reset()
+
+                        q = distributed_sinkhorn(out,tracker=sinkhorn_tracker,clamp_min=args.clamp_min)[-bs:]
+
+
+                         
+
+
+                        # --------- BEGIN: Q(after_sinkhorn) ANALYSIS CATCH ---------
+                        if not torch.isfinite(q).all():
+                            logger.error("========== Q(after_sinkhorn) NON-FINITE DETECTED ==========")
+
+                            # 1) Q 的基本状态（这是结果，不是原因）
+                            logger.error(
+                                f"[Q] shape={tuple(q.shape)} "
+                                f"finite_ratio={(torch.isfinite(q).float().mean().item()):.6f}"
+                            )
+
+                            # 2) out(before_sinkhorn) 的数值尺度（最重要的因果线索）
+                            of = out[torch.isfinite(out)]
+                            logger.error(
+                                "[CauseCheck] out(before_sinkhorn): "
+                                f"min={of.min().item():.3e}, "
+                                f"max={of.max().item():.3e}, "
+                                f"mean={of.mean().item():.3e}, "
+                                f"std={of.std(unbiased=False).item():.3e}"
+                            )
+
+                            # 3) out / epsilon 的有效尺度（直接对应 exp 是否 underflow）
+                            eps = args.epsilon
+                            scaled = of / eps
+                            logger.error(
+                                "[CauseCheck] out/epsilon: "
+                                f"min={scaled.min().item():.3e}, "
+                                f"max={scaled.max().item():.3e}"
+                            )
+
+                            # 4) 判断是否为典型 underflow → sumQ = 0 型失败
+                            # （即：exp(out/eps) 全为 0）
+                            if scaled.max().item() < -50:
+                                logger.error(
+                                    "[Conclusion] Likely cause: EXP UNDERFLOW in Sinkhorn "
+                                    "(out/epsilon << 0 → exp → 0 → sumQ=0 → NaN)"
+                                )
+
+                            # 5) mm_part 是否主导了 out 的尺度
+                            if 'mm_part' in locals():
+                                mmf = mm_part[torch.isfinite(mm_part)]
+                                logger.error(
+                                    "[CauseCheck] mm_part(queue·W^T): "
+                                    f"min={mmf.min().item():.3e}, "
+                                    f"max={mmf.max().item():.3e}, "
+                                    f"std={mmf.std(unbiased=False).item():.3e}"
+                                )
+
+                                if mmf.abs().max().item() > 20:
+                                    logger.error(
+                                        "[Conclusion] mm_part scale dominates out → "
+                                        "Sinkhorn input distribution skewed by queue/prototypes"
+                                    )
+
+                            # 6) queue 与 prototype 的范数状态（是否发生尺度漂移）
+                            if queue is not None:
+                                qi = queue[i]
+                                logger.error(
+                                    "[CauseCheck] queue[i] norm: "
+                                    f"mean={qi.norm(dim=1).mean().item():.3e}, "
+                                    f"max={qi.norm(dim=1).max().item():.3e}"
+                                )
+
+                            w = model.prototypes.weight
+                            logger.error(
+                                "[CauseCheck] prototypes.weight norm: "
+                                f"mean={w.norm(dim=1).mean().item():.3e}, "
+                                f"max={w.norm(dim=1).max().item():.3e}"
+                            )
+
+                            # 7) 给出“结构性原因”的判定（不是修复）
+                            logger.error(
+                                "[Final Diagnosis] Q becomes all-NaN *after* Sinkhorn, "
+                                "while inputs remain finite ⇒ "
+                                "this is a Sinkhorn normalization degeneracy, "
+                                "not a forward NaN propagation."
+                            )
+
+                            logger.error("============================================================")
+                            raise RuntimeError("Non-finite Q(after_sinkhorn) — analysis complete")
+
+                        # --------- END: Q(after_sinkhorn) ANALYSIS CATCH ---------
+
+
+
+
                         with torch.no_grad():
                             all_Q_epoch.append(q.detach().cpu())
                     if it % 10 == 0:
                         #print q.std, q.mean()
+                        if True:
+                            m = compute_batch_metrics(q)
+                            logger.info(
+                                f"[Metric] Epoch {epoch} Iter {it} "
+                                    f"H(Q)={m['q_entropy']:.5f} "
+                                    f"maxQ={m['q_maxprob']:.5f} gap={m['q_top1_top2_gap']:.5f} "
+                                    f"used_proto={m['q_num_used_proto']:.5f}\n"
+                            )
+                            with open(logfile, "a") as f:
+                                f.write(
+                                    f"[Q-AfterSinkhorn] Epoch {epoch} Iter {it} "
+                                    f"q_entropy={m['q_entropy']:.5f} "
+                                    f"q_maxprob={m['q_maxprob']:.5f} q_top1_top2_gap={m['q_top1_top2_gap']:.5f} "
+                                    f"q_num_used_proto={m['q_num_used_proto']:.5f}\n"
+                                )
                         logger.info(f"Sinkhorn Q: std {q.std().item():.4f}, mean {q.mean().item():.4f}")
                         with open(logfile, 'a') as f:
                             f.write(f"Task {task} Epoch {epoch} Iter {it} Sinkhorn Q: std {q.std().item():.4f}, mean {q.mean().item():.4f}\n")   
@@ -718,12 +916,24 @@ def train(train_loader, model, optimizer,scaler,task, epoch, lr_schedule, queue,
                     subloss = 0
                     for v in np.delete(np.arange(np.sum(args.nmb_crops)), crop_id):
                         x = output[bs * v: bs * (v + 1)] / args.temperature
+                        check_tensor("x(before_log_softmax)", x, logger)
+                        check_tensor("log_softmax(x)", F.log_softmax(x, dim=1), logger)
+                        check_tensor("q * log_softmax(x)", q * F.log_softmax(x, dim=1), logger)
                         subloss -= torch.mean(torch.sum(q * F.log_softmax(x, dim=1), dim=1))
                     loss += subloss / (np.sum(args.nmb_crops) - 1)
                 loss /= len(args.crops_for_assign)
                 if not torch.isfinite(loss):
                     logger.info("Loss is NaN/Inf — dumping diagnostics and stopping.")
                     # dump out_all min/max, scaled.max, mm_part stats, queue stats, etc.
+                    torch.save({
+                        "epoch": epoch,
+                        "iter": it,
+                        "task": task,
+                        "out": out.detach().cpu(),
+                        "q": q.detach().cpu(),
+                        "queue_i": queue[i].detach().cpu() if queue is not None else None,
+                        "prototypes": model.prototypes.weight.detach().cpu(),
+                    }, f"nan_dump_task{task}_epoch{epoch}_iter{it}.pt")
                     raise RuntimeError("NaN loss")
         else:
              
@@ -761,7 +971,7 @@ def train(train_loader, model, optimizer,scaler,task, epoch, lr_schedule, queue,
         optimizer.zero_grad()
         if args.use_fp16:
             scaler.scale(loss).backward()
-            if iteration < args.freeze_prototypes_niters and task ==0:
+            if iteration < args.freeze_prototypes_niters:# and _task ==0:
                 for name, p in model.named_parameters():
                     if "prototypes" in name:
                         p.grad = None
@@ -769,7 +979,7 @@ def train(train_loader, model, optimizer,scaler,task, epoch, lr_schedule, queue,
             scaler.update()
         else:
             loss.backward()
-            if iteration < args.freeze_prototypes_niters and task ==0:
+            if iteration < args.freeze_prototypes_niters:# and _task ==0:
                 for name, p in model.named_parameters():
                     if "prototypes" in name:
                         p.grad = None
@@ -797,30 +1007,104 @@ def train(train_loader, model, optimizer,scaler,task, epoch, lr_schedule, queue,
             )
     count_prototype_usage(all_Q_epoch, args.nmb_prototypes,epoch=epoch, logfile=logfile)
     return (epoch, losses.avg), queue
+def tensor_stats(t):
+    return (
+        f"min={t.min().item():.3e}, "
+        f"max={t.max().item():.3e}, "
+        f"mean={t.mean().item():.3e}, "
+        f"std={t.std().item():.3e}, "
+        f"l2={t.norm(dim=1).mean().item():.3e}"
+    )
+def check_tensor(name, t, logger, max_print=5):
+    if t is None:
+        return
 
+    finite_mask = torch.isfinite(t)
+    if finite_mask.all():
+        return
 
+    # 防止全 NaN / 全 Inf
+    if finite_mask.any():
+        t_finite = t[finite_mask]
+        t_min = t_finite.min().item()
+        t_max = t_finite.max().item()
+        t_mean = t_finite.mean().item()
+        t_std = t_finite.std().item()
+    else:
+        t_min = t_max = t_mean = t_std = float("nan")
+
+    bad = ~finite_mask
+
+    logger.error(
+        f"[NaN DETECTED] {name}\n"
+        f"  shape={tuple(t.shape)} dtype={t.dtype} device={t.device}\n"
+        f"  finite_ratio={finite_mask.float().mean().item():.4f}\n"
+        f"  min={t_min:.4e}, max={t_max:.4e}, "
+        f"mean={t_mean:.4e}, std={t_std:.4e}\n"
+        f"  bad_count={bad.sum().item()}"
+    )
+
+    # 打印前几个 NaN / Inf 的 index
+    idx = bad.nonzero(as_tuple=False)[:max_print]
+    logger.error(f"  bad_indices(sample)={idx.tolist()}")
+
+    raise RuntimeError(f"Non-finite tensor detected: {name}")
+
+ 
+def compute_batch_metrics(q: torch.Tensor, eps: float = 1e-12) -> dict:
+    """
+    q: [B, K] Sinkhorn assignment
+    returns: python floats
+    """
+    q_ = q.clamp(min=eps)
+    entropy = -(q_ * q_.log()).sum(dim=1).mean()  # mean over batch
+
+    top2 = q_.topk(2, dim=1).values              # [B, 2]
+    max_prob = top2[:, 0].mean()
+    top1_top2_gap = (top2[:, 0] - top2[:, 1]).mean()
+
+    assigned = q_.argmax(dim=1)
+    num_used_proto = assigned.unique().numel()
+
+    return {
+        "q_entropy": float(entropy.item()),
+        "q_maxprob": float(max_prob.item()),
+        "q_top1_top2_gap": float(top1_top2_gap.item()),
+        "q_num_used_proto": float(num_used_proto),
+    }
 @torch.no_grad()
-def distributed_sinkhorn(out):
+def distributed_sinkhorn(out, tracker=None,clamp_min=None):
     if True: 
         out = out.float() # per-sample stabilization: ensure max exponent is 0 
         out = out / args.epsilon 
         out = out - out.max(dim=1, keepdim=True).values # <= 0
+        if clamp_min is not None:
+            out = out.clamp(min=clamp_min)
         Q = torch.exp(out).t()  # now exp in (0, 1]
         Q = Q / (Q.sum() + 1e-12)
         B = Q.shape[1]
         K = Q.shape[0]
+    else:
+        Q = torch.exp(out / args.epsilon).t()   # K x B
+        B = Q.shape[1]
+        K = Q.shape[0]
 
+        # make the matrix sum to 1
+        Q /= torch.sum(Q)
          
      
 
     for _ in range(args.sinkhorn_iterations):
         # normalize each row: total weight per prototype must be 1/K
-        Q /= torch.sum(Q, dim=1, keepdim=True)
+        Q /= (torch.sum(Q, dim=1, keepdim=True) + 1e-12)
         Q /= K
-
+        if tracker is not None:
+            tracker.update(Q)
         # normalize each column: total weight per sample must be 1/B
-        Q /= torch.sum(Q, dim=0, keepdim=True)
+        Q /= (torch.sum(Q, dim=0, keepdim=True) + 1e-12)
         Q /= B
+        if tracker is not None:
+            tracker.update(Q)
 
     Q *= B  # columns sum to 1
     return Q.t()  # B x K

@@ -17,10 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
-import torch.distributed as dist
+ 
 import torch.optim
-import apex
-from apex.parallel.LARC import LARC
+ 
 
 from src.utils import (
     bool_flag,
@@ -123,7 +122,7 @@ parser.add_argument("--seed", type=int, default=31, help="seed")
 def main():
     global args
     args = parser.parse_args()
-    init_distributed_mode(args)
+    #init_distributed_mode(args)
     fix_random_seeds(args.seed)
     logger, training_stats = initialize_exp(args, "epoch", "loss")
 
@@ -135,10 +134,10 @@ def main():
         args.min_scale_crops,
         args.max_scale_crops,
     )
-    sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    #sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        sampler=sampler,
+        #sampler=sampler,
         batch_size=args.batch_size,
         num_workers=args.workers,
         pin_memory=True,
@@ -154,17 +153,17 @@ def main():
         nmb_prototypes=args.nmb_prototypes,
     )
     # synchronize batch norm layers
-    if args.sync_bn == "pytorch":
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    elif args.sync_bn == "apex":
-        # with apex syncbn we sync bn per group because it speeds up computation
-        # compared to global syncbn
-        process_group = apex.parallel.create_syncbn_process_group(args.syncbn_process_group_size)
-        model = apex.parallel.convert_syncbn_model(model, process_group=process_group)
+    # if args.sync_bn == "pytorch":
+    #     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    # elif args.sync_bn == "apex":
+    #     # with apex syncbn we sync bn per group because it speeds up computation
+    #     # compared to global syncbn
+    #     process_group = apex.parallel.create_syncbn_process_group(args.syncbn_process_group_size)
+    #     model = apex.parallel.convert_syncbn_model(model, process_group=process_group)
     # copy model to GPU
     model = model.cuda()
-    if args.rank == 0:
-        logger.info(model)
+    # if args.rank == 0:
+    #     logger.info(model)
     logger.info("Building model done.")
 
     # build optimizer
@@ -188,10 +187,10 @@ def main():
         logger.info("Initializing mixed precision done.")
 
     # wrap model
-    model = nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[args.gpu_to_work_on]
-    )
+    # model = nn.parallel.DistributedDataParallel(
+    #     model,
+    #     device_ids=[args.gpu_to_work_on]
+    # )
 
     # optionally resume from a checkpoint
     to_restore = {"epoch": 0}
@@ -220,7 +219,7 @@ def main():
         logger.info("============ Starting epoch %i ... ============" % epoch)
 
         # set sampler
-        train_loader.sampler.set_epoch(epoch)
+        #train_loader.sampler.set_epoch(epoch)
 
         # optionally starts a queue
         if args.queue_length > 0 and epoch >= args.epoch_queue_starts and queue is None:
