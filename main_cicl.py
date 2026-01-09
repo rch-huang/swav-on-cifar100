@@ -22,7 +22,6 @@ from src.utils import (
     fix_random_seeds,
     AverageMeter,
 )
-from src.multicropcifar100 import MultiCropDataset, TaskSubset
 import src.resnet50 as resnet_models
 datestamp = time.strftime("%Y%m%d%H%M%S")
 
@@ -34,32 +33,33 @@ parser = argparse.ArgumentParser(description="Single-GPU SwAV")
 #### data parameters ####
 #########################
  
-parser.add_argument("--nmb_crops", type=int, default=[2], nargs="+")
-parser.add_argument("--size_crops", type=int, default=[128], nargs="+")
-parser.add_argument("--min_scale_crops", type=float, default=[0.4 ], nargs="+")
-parser.add_argument("--max_scale_crops", type=float, default=[1.0 ], nargs="+")
+parser.add_argument("--nmb_crops", type=int, default=[2,4], nargs="+")
+parser.add_argument("--size_crops", type=int, default=[128,64], nargs="+")
+parser.add_argument("--min_scale_crops", type=float, default=[0.4,0.05 ], nargs="+")
+parser.add_argument("--max_scale_crops", type=float, default=[1.0,0.4 ], nargs="+")
 
 #########################
 ## swav specific params #
 #########################
 parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0])
-parser.add_argument("--temperature", default=0.1, type=float)
-parser.add_argument("--epsilon", default=0.005, type=float)
+parser.add_argument("--temperature", default=0.2, type=float)
+parser.add_argument("--epsilon", default=0.025, type=float)
 parser.add_argument("--sinkhorn_iterations", default=10, type=int)
 parser.add_argument("--feat_dim", default=128, type=int)
 parser.add_argument("--nmb_prototypes", default=250, type=int)
-parser.add_argument("--queue_length", type=int, default=0)
+parser.add_argument("--queue_length", type=int, default=1280)
 parser.add_argument("--epoch_queue_starts", type=int, default=5)
 parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=True)
 
 #########################
 #### optim parameters ###
 #########################
-parser.add_argument("--epochs", default=100, type=int)
-parser.add_argument("--batch_size", default=64, type=int)
+parser.add_argument("--dataset", default="tinyimagenet", type=str, choices=["cifar100","tinyimagenet"])    
+parser.add_argument("--epochs", default=400, type=int)
+parser.add_argument("--batch_size", default=256, type=int)
 parser.add_argument("--base_lr", default=0.05, type=float)
 parser.add_argument("--final_lr", type=float, default=0)
-parser.add_argument("--freeze_prototypes_niters", default=0, type=int)
+parser.add_argument("--freeze_prototypes_niters", default=20, type=int)
 parser.add_argument("--wd", default=1e-6, type=float)
 parser.add_argument("--warmup_epochs", default=10, type=int)
 parser.add_argument("--start_warmup", default=0, type=float)
@@ -73,8 +73,8 @@ parser.add_argument("--workers", default=0, type=int)
  
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
-parser.add_argument("--seed", type=int, default=30)
-parser.add_argument("--clamp_min", type=float, default=-80.0)
+parser.add_argument("--seed", type=int, default=40)
+parser.add_argument("--clamp_min", type=float, default=-50.0)
 class SinkhornTracker:
     """
     Track critical statistics for Sinkhorn normalization degeneracy (B-type).
@@ -312,90 +312,72 @@ def get_save_epoch_from_switch(_filepath):
                     return []
 
   
+import math
+import torch
+import torch.nn.functional as F
+
 @torch.no_grad()
 def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
-     
-    import torch
-    import torch.nn.functional as F
-
     model.eval()
 
-    all_P = []
+    all_logP = []
     all_Q = []
 
-    for inputs, _ in probe_loader:
-        inputs = inputs.to(device, non_blocking=True)
-         
-        feats, logits = model(inputs)   # logits: [B, K]
+    # 关掉 autocast，避免 fp16 把你的 P 搞出 0/NaN
+    with torch.cuda.amp.autocast(False):
+        for inputs, _ in probe_loader:
+            inputs = inputs.to(device, non_blocking=True)
 
-        
-        P = F.softmax(logits, dim=1)    # [B, K]
- 
-        
-        Q = distributed_sinkhorn(logits)  # [B, K]
+            feats, logits = model(inputs)          # logits: [B, K]
+            logits = logits.float()                # 强制 fp32
 
-        all_P.append(P)
-        all_Q.append(Q)
+            # 让 P 和训练一致（如果训练里用 logits/temperature）
+            logP = F.log_softmax(logits / args.temperature, dim=1)  # fp32, stable
 
-    P_all = torch.cat(all_P, dim=0)   # [N_probe, K]
-    Q_all = torch.cat(all_Q, dim=0)   # [N_probe, K]
+            Q = distributed_sinkhorn(logits)        # 你已在 sinkhorn 内 out.float() 更好；这里也确保 logits fp32
 
-    eps = 1e-6
-    P_clamped = P_all.clamp(min=eps)
-    Q_clamped = Q_all.clamp(min=eps)
+            # 先检查 Q 是否 finite（否则后面都没意义）
+            if not torch.isfinite(Q).all():
+                raise ValueError("Non-finite Q in probe_kl")
 
+            all_logP.append(logP)
+            all_Q.append(Q.float())
 
-    if False:
-          
-          
-        row_P = P_all.sum(dim=1)
-        row_Q = Q_all.sum(dim=1)
-        print(f"[Sanity] Row-sum P: mean={row_P.mean():.6f}, std={row_P.std():.6f}")
-        print(f"[Sanity] Row-sum Q: mean={row_Q.mean():.6f}, std={row_Q.std():.6f}")
+    logP_all = torch.cat(all_logP, dim=0)           # [N, K] fp32
+    Q_all    = torch.cat(all_Q, dim=0)              # [N, K] fp32
 
-        # Column-sum of Q
-        col_Q = Q_all.sum(dim=0)
-        print(f"[Sanity] Column-sum Q: mean={col_Q.mean():.6f}, std={col_Q.std():.6f}")
-        print(f"[Sanity] Column-sum Q range: [{col_Q.min():.6f}, {col_Q.max():.6f}]")
+    # clamp 只对 logQ 需要；logP 已经是 log-softmax，不会 -inf
+    eps = 1e-12
+    logQ = torch.log(Q_all.clamp_min(eps))
 
-        # Difference
-        print(f"[Sanity] Mean |Q-P| = {(Q_all - P_all).abs().mean().item():.6f}")
+    kl_q_p = (Q_all * (logQ - logP_all)).sum(dim=1).mean()
 
-        # Manual KL
-        log_Q = Q_clamped.log()
-        log_P = P_clamped.log()
-        kl_manual = (Q_clamped * (log_Q - log_P)).sum(dim=1).mean()
-        print(f"[Sanity] KL manual (Q||P) = {kl_manual.item():.6f}")
+    if not torch.isfinite(kl_q_p):
+        # 给你更有用的诊断
+        q_min = Q_all.min().item()
+        q_zero = (Q_all == 0).float().mean().item()
+        lp_min = logP_all.min().item()
+        raise ValueError(f"KL(Q||P) non-finite. Q_min={q_min:.3e}, Q_zero_frac={q_zero:.3e}, logP_min={lp_min:.3e}")
 
-        # Q||Q_prev
-        if prev_Q is not None:
-            prev_Q_clamped = prev_Q.to(device).clamp(min=eps)
-            kl_q_prev_manual = (Q_clamped * (log_Q - prev_Q_clamped.log())).sum(dim=1).mean()
-            print(f"[Sanity] KL(Q_t || Q_t-1) = {kl_q_prev_manual.item():.6f}")
-
-
-
-    # KL(Q || P) = sum_k Q_k log(Q_k / P_k)
-    kl_q_p = (Q_clamped * (Q_clamped.log() - P_clamped.log())).sum(dim=1).mean()
-    if kl_q_p.item() == float("inf") or math.isnan(kl_q_p.item()):
-        raise ValueError("KL(Q || P) is inf or nan!")
     # KL(Q_t || Q_{t-1})
     if prev_Q is not None:
-        prev_Q = prev_Q.to(device)
-        prev_Q_clamped = prev_Q.clamp(min=eps)
-        kl_q_t_prev = (Q_clamped * (Q_clamped.log() - prev_Q_clamped.log())).sum(dim=1).mean()
+        prev_Q = prev_Q.to(device).float()
+        logPrev = torch.log(prev_Q.clamp_min(eps))
+        kl_q_t_prev = (Q_all * (logQ - logPrev)).sum(dim=1).mean()
+        if not torch.isfinite(kl_q_t_prev):
+            kl_q_t_prev = torch.tensor(float("nan"), device=device)
     else:
         kl_q_t_prev = torch.tensor(float("nan"), device=device)
 
     model.train()
-    
     return kl_q_p.item(), kl_q_t_prev.item(), Q_all.detach().cpu()
+
 
 def main():
     global args
     args = parser.parse_args()
     with open("knn_switch_"+datestamp, 'w') as f:
-        f.write("epoch: [3,30,60,90,99]\n")
+        f.write("epoch: [30,60,90,99]\n")
         f.write(args.__repr__()+"\n")
         f.write("save_epoch: [50,99]\n")
         print("file name is knn_switch_"+datestamp)
@@ -406,32 +388,48 @@ def main():
     fix_random_seeds(args.seed)
     logger_, training_stats = initialize_exp(args, "epoch", "loss")
     # ============ build data ============
-    train_dataset = MultiCropDataset(
+    if args.dataset == "cifar100":
+        from src.multicropcifar100 import MultiCropDataset, TaskSubset
+        train_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL
+        )
+    if args.dataset == "tinyimagenet":
+        from src.multicroptinyimagenet import MultiCropDataset,TaskSubset 
+        train_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL,
          
-        args.size_crops,
-        args.nmb_crops,
-        args.min_scale_crops,
-        args.max_scale_crops,
-        CICL=CICL
-    )
+        )
+        selected_classes = train_dataset.selected_classes
+        label_remap = train_dataset.class_map
     train_loaders = []
     train_loader = None
     task_class_lists = []
      
     if CICL:
-        full_labels = np.array(train_dataset.dataset.targets)  # shape=(50000,)
-
+        if args.dataset == 'cifar100':
+            full_labels = np.array(train_dataset.dataset.targets)  # shape=(50000,)
+        elif args.dataset == 'tinyimagenet':
+            full_labels =  train_dataset.full_selected_labels()  # shape=(100000,)
         num_tasks = 10
         classes_per_task = 10
 
-        rng = np.random.default_rng(seed=args.seed)   # 强烈建议加 seed 以复现
-        all_classes = np.arange(100)
-        rng.shuffle(all_classes)
-        all_classes = [int(c) for c in all_classes]
-        task_class_lists = [
-            list(all_classes[t*classes_per_task : (t+1)*classes_per_task])
-            for t in range(num_tasks)
-        ]
+        rng = np.random.default_rng(seed=args.seed)    
+        if True:
+            all_classes = np.arange(100)
+            rng.shuffle(all_classes)
+            all_classes = [int(c) for c in all_classes]
+            task_class_lists = [
+                list(all_classes[t*classes_per_task : (t+1)*classes_per_task])
+                for t in range(num_tasks)
+            ]
         if False:
              
             task_class_lists[1] = task_class_lists[0]
@@ -469,49 +467,89 @@ def main():
         train_loaders.append(train_loader)
         task_class_lists.append(list(range(100)))  # all classes
     biggest_crop = args.size_crops[0]
-    test_transform = torchvision.transforms.Compose([
-       torchvision.transforms.Resize(biggest_crop),
-    torchvision.transforms.CenterCrop(biggest_crop),   
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize([0.5071, 0.4865, 0.4409],
-                         [0.2675, 0.2565, 0.2761]),
-    ])
-    test_dataset = torchvision.datasets.CIFAR100(
-        root='./',
-        train=False,
-        transform=test_transform,
-        download=True,
-    )
-    test_dataset = SubsampledDataset(test_dataset, ratio=0.5, seed=0)
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=256,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-    )
-    knn_transform = torchvision.transforms.Compose([
+    if args.dataset == "tinyimagenet":
+        from src.multicroptinyimagenet import MultiCropDataset     
+        test_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL,
+            selected_classes=selected_classes,
+            class_map=label_remap,
+            train=False
+        )
+        train_knn_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL,
+            selected_classes=selected_classes,
+            class_map=label_remap,
+            train=True,
+            val = True
+        )
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+        ) 
+        train_knn_loader = torch.utils.data.DataLoader(
+            train_knn_dataset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+        )
+    if args.dataset == "cifar100":
+        test_transform = torchvision.transforms.Compose([
         torchvision.transforms.Resize(biggest_crop),
-        torchvision.transforms.CenterCrop(biggest_crop),
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize([0.5071, 0.4865, 0.4409],
-                         [0.2675, 0.2565, 0.2761]),
-    ])
+        torchvision.transforms.CenterCrop(biggest_crop),   
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize([0.5071, 0.4865, 0.4409],
+                            [0.2675, 0.2565, 0.2761]),
+        ])
+        test_dataset = torchvision.datasets.CIFAR100(
+            root='./',
+            train=False,
+            transform=test_transform,
+            download=True,
+        )
+        test_dataset = SubsampledDataset(test_dataset, ratio=0.5, seed=0)
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+        )
+        knn_transform = torchvision.transforms.Compose([
+            torchvision.transforms.Resize(biggest_crop),
+            torchvision.transforms.CenterCrop(biggest_crop),
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize([0.5071, 0.4865, 0.4409],
+                            [0.2675, 0.2565, 0.2761]),
+        ])
 
-    train_knn_dataset = torchvision.datasets.CIFAR100(
-        root='./',
-        train=True,
-        transform=knn_transform,
-        download=True,
-    )
-    train_knn_dataset = SubsampledDataset(train_knn_dataset, ratio=0.5, seed=0)
-    train_knn_loader = torch.utils.data.DataLoader(
-        train_knn_dataset,
-        batch_size=256,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-    )
+        train_knn_dataset = torchvision.datasets.CIFAR100(
+            root='./',
+            train=True,
+            transform=knn_transform,
+            download=True,
+        )
+        train_knn_dataset = SubsampledDataset(train_knn_dataset, ratio=0.5, seed=0)
+        train_knn_loader = torch.utils.data.DataLoader(
+            train_knn_dataset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+        )
+    
+
     probe_loader = build_probe_loader(args)
     probe_Q_prev = None
     logger.info(f"Building data done with {len(train_dataset)} images loaded.")
