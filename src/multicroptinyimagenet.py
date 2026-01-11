@@ -48,7 +48,7 @@ class MultiCropDataset(Dataset):
         num_tasks=10,
         folderized_train_dir='/Scratch/repository/rh539/tiny-imagenet-200/train_foldered',    # default: <root>/train_foldered
         folderized_val_dir='/Scratch/repository/rh539/tiny-imagenet-200/val_foldered',      # default: <root>/val_foldered
-        selected_classes=None,
+        selected_100classes_out_of_200_for_tinyimagenet=None,
         class_map=None,
      ):
         super().__init__()
@@ -67,20 +67,20 @@ class MultiCropDataset(Dataset):
             root=data_root,
             transform=None,  # do multi-crop transform inside
         )
-        if selected_classes == None:    
+        if selected_100classes_out_of_200_for_tinyimagenet == None:    
             total_classes = len(self.dataset.classes)
             rng = np.random.RandomState(seed)
             all_cls = np.arange(total_classes)
-            selected_classes = rng.choice(all_cls, size=num_used_classes, replace=False)
-            selected_classes = [int(x) for x in selected_classes]
+            selected_100classes_out_of_200_for_tinyimagenet = rng.choice(all_cls, size=num_used_classes, replace=False)
+            selected_100classes_out_of_200_for_tinyimagenet = [int(x) for x in selected_100classes_out_of_200_for_tinyimagenet]
             classes_per_task = num_used_classes // num_tasks  
          
-        self.selected_classes = selected_classes
+        self.selected_100classes_out_of_200_for_tinyimagenet = selected_100classes_out_of_200_for_tinyimagenet
          
       
 
          
-        active_classes = set(selected_classes)
+        active_classes = set(selected_100classes_out_of_200_for_tinyimagenet)
 
          
         filtered = []
@@ -95,7 +95,7 @@ class MultiCropDataset(Dataset):
             self.indices = self.indices[:val_size]
          
         if class_map is  None: 
-            self.class_map = {old: new for new, old in enumerate(selected_classes)}
+            self.class_map = {old: new for new, old in enumerate(selected_100classes_out_of_200_for_tinyimagenet)}
         else:
             self.class_map = class_map
         # -------------------------
@@ -340,7 +340,7 @@ if __name__ == "__main__":
     #prepare_tinyimagenet_val_as_imagefolder(root, overwrite=False)
 
     # Create tasks: select 100/200 and split to 10 tasks
-    selected_classes, tasks = make_tinyimagenet_tasks_100_of_200(seed=42)
+    selected_100classes_out_of_200_for_tinyimagenet, tasks = make_tinyimagenet_tasks_100_of_200(seed=42)
 
     # Build base multicrop dataset (train split)
     # IMPORTANT: point root to the foldered train if you prepared it
@@ -352,7 +352,7 @@ if __name__ == "__main__":
         max_scale_crops=args.max_scale_crops,
         CICL=True,
        
-        selected_classes=selected_classes,
+        selected_100classes_out_of_200_for_tinyimagenet=selected_100classes_out_of_200_for_tinyimagenet,
         val_foldered_root=val_foldered,
     )
 

@@ -33,21 +33,21 @@ parser = argparse.ArgumentParser(description="Single-GPU SwAV")
 #### data parameters ####
 #########################
  
-parser.add_argument("--nmb_crops", type=int, default=[2,4], nargs="+")
-parser.add_argument("--size_crops", type=int, default=[128,64], nargs="+")
-parser.add_argument("--min_scale_crops", type=float, default=[0.4,0.05 ], nargs="+")
-parser.add_argument("--max_scale_crops", type=float, default=[1.0,0.4 ], nargs="+")
+parser.add_argument("--nmb_crops", type=int, default=[2], nargs="+")
+parser.add_argument("--size_crops", type=int, default=[128], nargs="+")
+parser.add_argument("--min_scale_crops", type=float, default=[0.4 ], nargs="+")
+parser.add_argument("--max_scale_crops", type=float, default=[1.0 ], nargs="+")
 
 #########################
 ## swav specific params #
 #########################
 parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0])
 parser.add_argument("--temperature", default=0.2, type=float)
-parser.add_argument("--epsilon", default=0.025, type=float)
+parser.add_argument("--epsilon", default=0.03, type=float)
 parser.add_argument("--sinkhorn_iterations", default=10, type=int)
 parser.add_argument("--feat_dim", default=128, type=int)
 parser.add_argument("--nmb_prototypes", default=250, type=int)
-parser.add_argument("--queue_length", type=int, default=1280)
+parser.add_argument("--queue_length", type=int, default=0)
 parser.add_argument("--epoch_queue_starts", type=int, default=5)
 parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=True)
 
@@ -55,11 +55,11 @@ parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=True)
 #### optim parameters ###
 #########################
 parser.add_argument("--dataset", default="tinyimagenet", type=str, choices=["cifar100","tinyimagenet"])    
-parser.add_argument("--epochs", default=400, type=int)
+parser.add_argument("--epochs", default=200, type=int)
 parser.add_argument("--batch_size", default=256, type=int)
 parser.add_argument("--base_lr", default=0.05, type=float)
 parser.add_argument("--final_lr", type=float, default=0)
-parser.add_argument("--freeze_prototypes_niters", default=20, type=int)
+parser.add_argument("--freeze_prototypes_niters", default=0, type=int)
 parser.add_argument("--wd", default=1e-6, type=float)
 parser.add_argument("--warmup_epochs", default=10, type=int)
 parser.add_argument("--start_warmup", default=0, type=float)
@@ -75,6 +75,8 @@ parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
 parser.add_argument("--seed", type=int, default=40)
 parser.add_argument("--clamp_min", type=float, default=-50.0)
+parser.add_argument("--selected_100classes_out_of_200_for_tinyimagenet", type=str, default=None)
+parser.add_argument("--label_remap_for_tinyimagenet", type=str, default=None)
 class SinkhornTracker:
     """
     Track critical statistics for Sinkhorn normalization degeneracy (B-type).
@@ -247,19 +249,39 @@ def build_probe_loader(args):
     from torch.utils.data import DataLoader, Subset
     import torch
 
-    probe_transform = transforms.Compose([
-        transforms.Resize(96),
-        transforms.CenterCrop(96),
-        transforms.ToTensor(),
-    ])
+     
 
-    if True:
+    if args.dataset == "tinyimagenet":
+        from src.multicroptinyimagenet import MultiCropDataset
+        base_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=True,
+            selected_100classes_out_of_200_for_tinyimagenet=args.selected_100classes_out_of_200_for_tinyimagenet,
+            class_map=args.label_remap_for_tinyimagenet,
+            train=True,
+            val = True
+        )
+        probe_transform = transforms.Compose([
+            transforms.Resize(args.size_crops[0]), 
+            transforms.CenterCrop(args.size_crops[0]),
+            transforms.ToTensor(),
+        ])
+
+    elif args.dataset == "cifar100":
         base_dataset = datasets.CIFAR100(
             root='./',
             train=True,
             transform=probe_transform,
             download=True,
         )
+        probe_transform = transforms.Compose([
+        transforms.Resize(96),
+        transforms.CenterCrop(96),
+        transforms.ToTensor(),
+    ])
 
     num_samples = min(512, len(base_dataset))
 
@@ -377,7 +399,7 @@ def main():
     global args
     args = parser.parse_args()
     with open("knn_switch_"+datestamp, 'w') as f:
-        f.write("epoch: [30,60,90,99]\n")
+        f.write("epoch: [1,30,60,90,99]\n")
         f.write(args.__repr__()+"\n")
         f.write("save_epoch: [50,99]\n")
         print("file name is knn_switch_"+datestamp)
@@ -407,8 +429,8 @@ def main():
             CICL=CICL,
          
         )
-        selected_classes = train_dataset.selected_classes
-        label_remap = train_dataset.class_map
+        args.selected_100classes_out_of_200_for_tinyimagenet = train_dataset.selected_100classes_out_of_200_for_tinyimagenet
+        args.label_remap_for_tinyimagenet = train_dataset.class_map
     train_loaders = []
     train_loader = None
     task_class_lists = []
@@ -475,8 +497,8 @@ def main():
             args.min_scale_crops,
             args.max_scale_crops,
             CICL=CICL,
-            selected_classes=selected_classes,
-            class_map=label_remap,
+            selected_100classes_out_of_200_for_tinyimagenet=args.selected_100classes_out_of_200_for_tinyimagenet,
+            class_map=args.label_remap_for_tinyimagenet,
             train=False
         )
         train_knn_dataset = MultiCropDataset(
@@ -485,8 +507,8 @@ def main():
             args.min_scale_crops,
             args.max_scale_crops,
             CICL=CICL,
-            selected_classes=selected_classes,
-            class_map=label_remap,
+            selected_100classes_out_of_200_for_tinyimagenet=args.selected_100classes_out_of_200_for_tinyimagenet,
+            class_map=args.label_remap_for_tinyimagenet,
             train=True,
             val = True
         )
