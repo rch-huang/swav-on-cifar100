@@ -7,8 +7,20 @@ from collections import defaultdict
 
 def plot_knn_from_log(txt_path):
     # ---------- 1. Read file ----------
+    lines = []
     with open(txt_path, "r") as f:
-        lines = f.readlines()
+        # grep line with 'KNN eval on Task'
+        line = f.readline()
+        while line:
+            if "KNN eval on Task" in line:
+                lines.append(line.strip())
+            if "Starting training on task " in line:
+                lines.append("Eval at Task " + line.split("Starting training on task ")[-1].strip())
+            line = f.readline()
+            
+    print(f"[Info] Found {len(lines)} KNN eval lines as follow:")
+    for l in lines:
+        print("  ", l) 
 
     # ---------- 2. Parse records ----------
     records = []
@@ -31,7 +43,7 @@ def plot_knn_from_log(txt_path):
     # ---------- 3. Organize curves ----------
     curves = defaultdict(list)
     for task, epoch, eval_task, acc in records:
-        global_epoch = task * 100 + epoch
+        global_epoch = task * 120 + epoch
         curves[eval_task].append((global_epoch, acc))
 
     for k in curves:
@@ -48,8 +60,8 @@ def plot_knn_from_log(txt_path):
         line, = plt.plot(xs, ys, label=f"Task {eval_task}")
         color = line.get_color()
 
-        # 起点圆圈
-        plt.scatter(xs[0], ys[0], s=60, marker="o", color=color, zorder=3)
+  
+        plt.scatter(xs[0], ys[0], s=20, marker="o", color=color, zorder=3)
 
         # 记录末尾信息
         final_infos.append((ys[-1], eval_task, color))
@@ -83,7 +95,7 @@ def plot_knn_from_log(txt_path):
     plt.xlabel("Global Epoch")
     plt.ylabel("KNN Accuracy (%)")
 
-    # 固定 + 缩小 legend（关键修改）
+ 
     plt.legend(
         loc="upper left",
         fontsize=8,

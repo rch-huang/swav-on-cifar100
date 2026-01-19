@@ -42,20 +42,20 @@ parser.add_argument("--max_scale_crops", type=float, default=[1.0 ], nargs="+")
 ## swav specific params #
 #########################
 parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0])
-parser.add_argument("--temperature", default=0.2, type=float)
-parser.add_argument("--epsilon", default=0.03, type=float)
+parser.add_argument("--temperature", default=0.5, type=float)
+parser.add_argument("--epsilon", default=0.01, type=float)
 parser.add_argument("--sinkhorn_iterations", default=10, type=int)
 parser.add_argument("--feat_dim", default=128, type=int)
 parser.add_argument("--nmb_prototypes", default=250, type=int)
 parser.add_argument("--queue_length", type=int, default=0)
 parser.add_argument("--epoch_queue_starts", type=int, default=5)
-parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=True)
+parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=False)
 
 #########################
 #### optim parameters ###
 #########################
-parser.add_argument("--dataset", default="tinyimagenet", type=str, choices=["cifar100","tinyimagenet"])    
-parser.add_argument("--epochs", default=200, type=int)
+parser.add_argument("--dataset", default="cifar100", type=str, choices=["cifar100","tinyimagenet","food101"])    
+parser.add_argument("--epochs", default=120, type=int)
 parser.add_argument("--batch_size", default=256, type=int)
 parser.add_argument("--base_lr", default=0.05, type=float)
 parser.add_argument("--final_lr", type=float, default=0)
@@ -73,7 +73,7 @@ parser.add_argument("--workers", default=0, type=int)
  
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
-parser.add_argument("--seed", type=int, default=40)
+parser.add_argument("--seed", type=int, default=45)
 parser.add_argument("--clamp_min", type=float, default=-50.0)
 parser.add_argument("--selected_100classes_out_of_200_for_tinyimagenet", type=str, default=None)
 parser.add_argument("--label_remap_for_tinyimagenet", type=str, default=None)
@@ -182,7 +182,7 @@ def auto_bins_by_quantile(counts, n_bins=10,epoch=-1,logfile='train_log.txt'):
             f.write(f"Epoch {epoch} Prototype Usage Range [{low:.1f} – {high:.1f}]: {num_items} prototypes\n")  
     return bin_edges
 
-def knn_eval(train_feats, train_labels, test_feats, test_labels, k=50):
+def knn_eval(train_feats, train_labels, test_feats, test_labels, k=20):
     """
     train_feats: (N, D)
     test_feats:  (M, D)
@@ -258,7 +258,7 @@ def build_probe_loader(args):
             args.nmb_crops,
             args.min_scale_crops,
             args.max_scale_crops,
-            CICL=True,
+            CICL=args.CICL,
             selected_100classes_out_of_200_for_tinyimagenet=args.selected_100classes_out_of_200_for_tinyimagenet,
             class_map=args.label_remap_for_tinyimagenet,
             train=True,
@@ -269,19 +269,31 @@ def build_probe_loader(args):
             transforms.CenterCrop(args.size_crops[0]),
             transforms.ToTensor(),
         ])
-
+    elif args.dataset == "food101":
+        from src.multicropfood101 import MultiCropDataset
+        base_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            # CICL=args.CICL,
+            train=True,
+            val = True
+        )
+         
     elif args.dataset == "cifar100":
+        probe_transform = transforms.Compose([
+        transforms.Resize(96),
+        transforms.CenterCrop(96),
+        transforms.ToTensor(),
+    ])
         base_dataset = datasets.CIFAR100(
             root='./',
             train=True,
             transform=probe_transform,
             download=True,
         )
-        probe_transform = transforms.Compose([
-        transforms.Resize(96),
-        transforms.CenterCrop(96),
-        transforms.ToTensor(),
-    ])
+         
 
     num_samples = min(512, len(base_dataset))
 
@@ -399,9 +411,10 @@ def main():
     global args
     args = parser.parse_args()
     with open("knn_switch_"+datestamp, 'w') as f:
-        f.write("epoch: [1,30,60,90,99]\n")
+        #f.write("epoch: [1,30,60,90,99,120,150,180,210,240,270,300,330,360,390,399]\n")
+        f.write("epoch: [1,30,60,90,119]\n")
         f.write(args.__repr__()+"\n")
-        f.write("save_epoch: [50,99]\n")
+        f.write("save_epoch: [119]\n")
         print("file name is knn_switch_"+datestamp)
     
     args.rank = 0
@@ -419,6 +432,15 @@ def main():
             args.max_scale_crops,
             CICL=CICL
         )
+    if args.dataset == "food101":
+        from src.multicropfood101 import MultiCropDataset, TaskSubset
+        train_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL,
+        )
     if args.dataset == "tinyimagenet":
         from src.multicroptinyimagenet import MultiCropDataset,TaskSubset 
         train_dataset = MultiCropDataset(
@@ -427,7 +449,6 @@ def main():
             args.min_scale_crops,
             args.max_scale_crops,
             CICL=CICL,
-         
         )
         args.selected_100classes_out_of_200_for_tinyimagenet = train_dataset.selected_100classes_out_of_200_for_tinyimagenet
         args.label_remap_for_tinyimagenet = train_dataset.class_map
@@ -440,6 +461,10 @@ def main():
             full_labels = np.array(train_dataset.dataset.targets)  # shape=(50000,)
         elif args.dataset == 'tinyimagenet':
             full_labels =  train_dataset.full_selected_labels()  # shape=(100000,)
+        elif args.dataset == 'food101':
+            # full_labels = np.array(train_dataset.dataset['train']['label'])  # shape=(75750,)
+            # full_labels = full_labels[full_labels < 100] 
+            full_labels = np.array(train_dataset.dataset['label'][train_dataset.indices])
         num_tasks = 10
         classes_per_task = 10
 
@@ -489,6 +514,41 @@ def main():
         train_loaders.append(train_loader)
         task_class_lists.append(list(range(100)))  # all classes
     biggest_crop = args.size_crops[0]
+    if args.dataset == "food101":
+        from src.multicropfood101 import MultiCropDataset
+        test_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL,
+            train=False
+        )
+        train_knn_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL,
+            train=True,
+            val = True
+        )
+        test_dataset = SubsampledDataset(test_dataset, ratio=0.5, seed=0)
+        #train_knn_dataset = SubsampledDataset(train_knn_dataset, ratio=0.1, seed=0) 
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+        ) 
+        train_knn_loader = torch.utils.data.DataLoader(
+            train_knn_dataset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=True,
+        )
     if args.dataset == "tinyimagenet":
         from src.multicroptinyimagenet import MultiCropDataset     
         test_dataset = MultiCropDataset(
@@ -512,6 +572,8 @@ def main():
             train=True,
             val = True
         )
+        test_dataset = SubsampledDataset(test_dataset, ratio=0.5, seed=0)
+        train_knn_dataset = SubsampledDataset(train_knn_dataset, ratio=0.2, seed=0) 
         test_loader = torch.utils.data.DataLoader(
             test_dataset,
             batch_size=256,
@@ -583,8 +645,10 @@ def main():
         output_dim=args.feat_dim,
         nmb_prototypes=args.nmb_prototypes,
     )
+    os.mkdir("log_"+datestamp)
 
-    logfile = 'train_log_'+datestamp
+    logfile = f"log_{datestamp}/train_log.txt"
+
     with open(logfile, 'a') as f:
         f.write(args.__repr__()+"\n")
     model = model.cuda()
@@ -592,6 +656,7 @@ def main():
     logger.info("Building model done.")
     seen_classes = []
     knn_accs = []
+    cost_probe_loaders = []
     for _task_number in range(len(train_loaders)):
         task_number = _task_number
         if False:
@@ -600,6 +665,8 @@ def main():
             elif _task_number ==1:
                 task_number = 0
         train_loader = train_loaders[task_number]
+        cost_probe_loader =  build_cost_probe_batch(train_loader.dataset, args.batch_size, device="cuda")
+        cost_probe_loaders.append(cost_probe_loader)
         seen_classes.append(task_class_lists[task_number])
         print(f"Starting training on task {task_number} with classes {task_class_lists[task_number]}...")
         with open(logfile, 'a') as f:
@@ -659,6 +726,16 @@ def main():
             proto_hash_ref = tensor_hash(model.prototypes.weight.detach())
 
             if epoch in get_knneval_epoch_from_switch(datestamp) or 0 in get_knneval_epoch_from_switch(datestamp):
+                for cost_probe_loader_idx in range(len(cost_probe_loaders)):
+                    _cost_probe_loader = cost_probe_loaders[cost_probe_loader_idx]
+                    
+                    result = plot_cost_matrix(_cost_probe_loader[0],model,args,path=f"log_{datestamp}/cost_data{cost_probe_loader_idx}_onTask{task_number}_epoch{epoch}.png", task=task_number, epoch=epoch, data_index=cost_probe_loader_idx)
+                    print(f"Epoch {epoch} Cost matrix plot for data from task {cost_probe_loader_idx} on model of task {task_number} saved to log_{datestamp}/cost_data{cost_probe_loader_idx}_onTask{task_number}_epoch{epoch}.png")
+                     
+
+                     
+
+                 
                 for classes_task_ind in range(len(seen_classes)):
                     task_classes = seen_classes[classes_task_ind]
                     train_feats, train_labels = extract_train_features(model, train_knn_loader,task_classes)
@@ -1169,6 +1246,649 @@ def distributed_sinkhorn(out, tracker=None,clamp_min=None):
     Q *= B  # columns sum to 1
     return Q.t()  # B x K
  
+def build_cost_probe_batch(dataset, batch_size, device):
+    indices = torch.randperm(len(dataset))[:batch_size]
+    images = torch.stack([dataset[i][0] for i in indices])
+    return [images.to(device) , indices.cpu().numpy()]
+
+ 
+ 
+
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from typing import Optional, Dict
+
+@torch.no_grad()
+def _plot_cost_matrix(
+    batch_feats: torch.Tensor,               # [B, D]
+    proto_weights: torch.Tensor,             # [K, D]
+    *,
+    Q: torch.Tensor,                         # [B, K]
+    logits: Optional[torch.Tensor] = None,   # [B, K]
+    cost_mode: str = "neg_dot",              # "neg_dot" | "sqeuclidean"
+    normalize: bool = True,
+    sort_rows: str = "argmin",
+    sort_cols: str = "mass",
+    title: Optional[str] = None,
+    save_path: str = "./cost_and_q.png",
+    dpi: int = 160,
+    C_vmax_percentile: Optional[float] = 99.0,
+    C_vmin_percentile: Optional[float] = 1.0,
+    Q_vmax_percentile: Optional[float] = 99.5,
+    Q_vmin_percentile: Optional[float] = 0.0,
+    show: bool = False,
+
+    # ---- NEW ----
+    save_csv_dir: Optional[str] = None, 
+    task = 0,
+    epoch = 0,      
+    csv_prefix: str = "debug",               # file prefix
+    force_geometric_C: bool = True,          # compute C_geom for sanity even if logits is provided
+    sanity_print: bool = True,               # print sanity stats
+) -> Dict[str, torch.Tensor]:
+
+    assert batch_feats.dim() == 2
+    assert proto_weights.dim() == 2
+    assert Q is not None and Q.dim() == 2
+
+    device = batch_feats.device
+    B, D = batch_feats.shape
+    K, D2 = proto_weights.shape
+    assert D == D2
+    assert Q.shape == (B, K)
+
+    # --------------------------
+    # 1) Build C_used (what you plot)
+    # --------------------------
+    C_used = None
+    if logits is not None:
+        C_used = -logits
+    else:
+        C_used = None  # will be set to geom below
+
+    # --------------------------
+    # 1b) Build C_geom (pure geometry) for sanity
+    # --------------------------
+    # This lets us detect if -logits is “flattening” the visualization.
+    z = batch_feats
+    c = proto_weights
+    if normalize and cost_mode == "neg_dot":
+        z = torch.nn.functional.normalize(z, dim=1)
+        c = torch.nn.functional.normalize(c, dim=1)
+
+    if cost_mode == "neg_dot":
+        C_geom = -(z @ c.t())  # [B,K]
+    elif cost_mode == "sqeuclidean":
+        z2 = (batch_feats ** 2).sum(dim=1, keepdim=True)
+        c2 = (proto_weights ** 2).sum(dim=1, keepdim=True).t()
+        sim = batch_feats @ proto_weights.t()
+        C_geom = z2 + c2 - 2.0 * sim
+    else:
+        raise ValueError(f"Unknown cost_mode: {cost_mode}")
+
+    if C_used is None or force_geometric_C:
+        # If no logits provided, or if you prefer to plot geom anyway.
+        # If logits exists and you still want to plot -logits, set force_geometric_C=False.
+        if C_used is None:
+            C_used = C_geom
+        # else keep C_used = -logits for plotting, but still have C_geom to compare
+
+    # to numpy
+    C_used_cpu = C_used.detach().float().cpu().numpy()
+    C_geom_cpu = C_geom.detach().float().cpu().numpy()
+    Q_cpu = Q.detach().float().cpu().numpy()
+
+    # --------------------------
+    # 2) Row sorting (from C_used)
+    # --------------------------
+    row_idx = np.arange(B)
+    if sort_rows == "argmin":
+        row_best = np.argmin(C_used_cpu, axis=1)
+        row_minc = C_used_cpu[np.arange(B), row_best]
+        row_idx = np.lexsort((row_minc, row_best))
+    elif sort_rows == "mincost":
+        row_idx = np.argsort(np.min(C_used_cpu, axis=1))
+    elif sort_rows == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown sort_rows: {sort_rows}")
+
+    C_used_cpu = C_used_cpu[row_idx, :]
+    C_geom_cpu = C_geom_cpu[row_idx, :]
+    Q_cpu      = Q_cpu[row_idx, :]
+
+    # --------------------------
+    # 3) Column sorting (from Q after row-sort)
+    # --------------------------
+    col_idx = np.arange(K)
+    if sort_cols == "mass":
+        qmass = Q_cpu.sum(axis=0)
+        col_idx = np.argsort(-qmass)
+    elif sort_cols == "usage":
+        hard = np.argmax(Q_cpu, axis=1)
+        usage = np.bincount(hard, minlength=K).astype(np.float32)
+        col_idx = np.argsort(-usage)
+    elif sort_cols == "avgcost":
+        col_avg = C_used_cpu.mean(axis=0)
+        col_idx = np.argsort(col_avg)
+    elif sort_cols == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown sort_cols: {sort_cols}")
+
+    C_used_cpu = C_used_cpu[:, col_idx]
+    C_geom_cpu = C_geom_cpu[:, col_idx]
+    Q_cpu      = Q_cpu[:, col_idx]
+
+    # --------------------------
+    # 4) Robust scaling
+    # --------------------------
+    def _robust_vmin_vmax(mat: np.ndarray, vmin_p, vmax_p):
+        if vmin_p is None or vmax_p is None:
+            return None, None
+        flat = mat.reshape(-1)
+        vmin = float(np.percentile(flat, vmin_p))
+        vmax = float(np.percentile(flat, vmax_p))
+        # Detect “near-constant” cases too
+        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin >= vmax) or (abs(vmax - vmin) < 1e-6):
+            return None, None
+        return vmin, vmax
+
+    C_vmin, C_vmax = _robust_vmin_vmax(C_used_cpu, C_vmin_percentile, C_vmax_percentile)
+
+    if Q_vmin_percentile is None or Q_vmax_percentile is None:
+        Q_vmin, Q_vmax = None, None
+    else:
+        Q_vmin = float(np.percentile(Q_cpu.reshape(-1), Q_vmin_percentile))
+        Q_vmax = float(np.percentile(Q_cpu.reshape(-1), Q_vmax_percentile))
+        if (not np.isfinite(Q_vmin)) or (not np.isfinite(Q_vmax)) or (Q_vmin >= Q_vmax) or (abs(Q_vmax - Q_vmin) < 1e-12):
+            Q_vmin, Q_vmax = None, None
+
+    # --------------------------
+    # 4b) SANITY CHECKS (prints)
+    # --------------------------
+    def _stats(name, mat):
+        flat = mat.reshape(-1)
+        p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
+        return (f"{name}: shape={mat.shape}, "
+                f"min={p[0]:.6g}, p1={p[1]:.6g}, p5={p[2]:.6g}, "
+                f"p50={p[3]:.6g}, p95={p[4]:.6g}, p99={p[5]:.6g}, max={p[6]:.6g}, "
+                f"range={p[6]-p[0]:.6g}")
+
+    sanity_lines = []
+    sanity_lines.append(_stats("C_used(sorted)", C_used_cpu))
+    sanity_lines.append(_stats("C_geom(sorted)", C_geom_cpu))
+    sanity_lines.append(_stats("Q(sorted)", Q_cpu))
+
+    # Detect “flat image” risk
+    if np.std(C_used_cpu) < 1e-4:
+        sanity_lines.append("WARNING: std(C_used) is very small -> heatmap may look almost constant (flat color).")
+
+    # Does Q put mass on low-cost regions? (Using C_geom is often more meaningful)
+    # Compare expected cost under Q vs uniform.
+    eps = 1e-12
+    Q_row = Q_cpu / (Q_cpu.sum(axis=1, keepdims=True) + eps)
+    uniform = np.full_like(Q_row, 1.0 / Q_row.shape[1])
+    E_cost_Q = (Q_row * C_geom_cpu).sum(axis=1).mean()
+    E_cost_U = (uniform * C_geom_cpu).sum(axis=1).mean()
+    sanity_lines.append(f"E[C_geom | Q] (mean over rows) = {E_cost_Q:.6g}")
+    sanity_lines.append(f"E[C_geom | uniform] (mean over rows) = {E_cost_U:.6g}")
+    sanity_lines.append(f"Gap (uniform - Q) = {E_cost_U - E_cost_Q:.6g}  (should be >= 0 if Q prefers low cost)")
+
+    if sanity_print:
+        print("\n".join(sanity_lines))
+
+    # --------------------------
+    # 5) Plot
+    # --------------------------
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.2))
+    ax0, ax1 = axes
+
+    im0 = ax0.imshow(C_used_cpu, aspect="auto", interpolation="nearest", vmin=C_vmin, vmax=C_vmax)
+    ax0.set_title("Cost matrix C_used (sorted)")
+    ax0.set_xlabel("Prototypes (sorted)")
+    ax0.set_ylabel("Batch samples (sorted)")
+    fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+
+    im1 = ax1.imshow(Q_cpu, aspect="auto", interpolation="nearest", vmin=Q_vmin, vmax=Q_vmax)
+    ax1.set_title("Assignment matrix Q (sorted)")
+    ax1.set_xlabel("Prototypes (same order as C)")
+    ax1.set_ylabel("Batch samples (same order as C)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    if title is None:
+        title = f"C & Q (B={B}, K={K}) | rows={sort_rows}, cols={sort_cols}, mode={cost_mode}"
+    fig.suptitle(title, y=0.98)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=dpi)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    # --------------------------
+    # 6) Save CSVs (sorted matrices + indices)
+    # --------------------------
+    if save_csv_dir is  None:
+        save_csv_dir = os.path.dirname(save_path) + f"_{task}_{epoch}"
+    if True:
+        os.makedirs(save_csv_dir, exist_ok=True)
+        np.savetxt(os.path.join(save_csv_dir, f"{csv_prefix}_C_used_sorted.csv"), C_used_cpu, delimiter=",")
+        np.savetxt(os.path.join(save_csv_dir, f"{csv_prefix}_C_geom_sorted.csv"), C_geom_cpu, delimiter=",")
+        np.savetxt(os.path.join(save_csv_dir, f"{csv_prefix}_Q_sorted.csv"), Q_cpu, delimiter=",")
+        np.savetxt(os.path.join(save_csv_dir, f"{csv_prefix}_row_idx.csv"), row_idx.astype(np.int64), fmt="%d", delimiter=",")
+        np.savetxt(os.path.join(save_csv_dir, f"{csv_prefix}_col_idx.csv"), col_idx.astype(np.int64), fmt="%d", delimiter=",")
+        with open(os.path.join(save_csv_dir, f"{csv_prefix}_sanity_report.txt"), "w") as f:
+            f.write("\n".join(sanity_lines) + "\n")
+
+    # return tensors for further analysis
+    row_idx_t = torch.from_numpy(row_idx).to(device)
+    col_idx_t = torch.from_numpy(col_idx).to(device)
+    if True:
+        def _sha1_f32(x: np.ndarray) -> str:
+            x = np.asarray(x, dtype=np.float32, order="C")
+            return hashlib.sha1(x.tobytes()).hexdigest()
+
+        def _ensure_dir(p: str):
+            os.makedirs(p, exist_ok=True)
+
+        # 在 _plot_cost_matrix 内部，to numpy 之后、排序之前，加入：
+        C_used_raw = C_used.detach().float().cpu().numpy()   # [B,K] 未排序
+        C_geom_raw = C_geom.detach().float().cpu().numpy()   # [B,K] 未排序
+        Q_raw      = Q.detach().float().cpu().numpy()        # [B,K] 未排序
+        logits_raw = None
+        if logits is not None:
+            logits_raw = logits.detach().float().cpu().numpy()
+
+        # （你原有排序逻辑不变，排序后得到 C_used_cpu / C_geom_cpu / Q_cpu）
+
+        # 在保存 CSV 的部分，同时保存一个 npz bundle（强烈建议）
+        if save_csv_dir is None:
+            save_csv_dir = os.path.dirname(save_path) + f"_{task}_{epoch}"
+        _ensure_dir(save_csv_dir)
+
+        # 把 vmin/vmax 最终值也保存下来（否则重放时可能颜色不一致）
+        bundle_meta = dict(
+            B=int(B), K=int(K), D=int(D),
+            cost_mode=cost_mode,
+            normalize=bool(normalize),
+            sort_rows=sort_rows,
+            sort_cols=sort_cols,
+            # 注意：保存 percentiles + 最终的 vmin/vmax
+            C_vmin_percentile=C_vmin_percentile,
+            C_vmax_percentile=C_vmax_percentile,
+            Q_vmin_percentile=Q_vmin_percentile,
+            Q_vmax_percentile=Q_vmax_percentile,
+            C_vmin=float(C_vmin) if C_vmin is not None else None,
+            C_vmax=float(C_vmax) if C_vmax is not None else None,
+            Q_vmin=float(Q_vmin) if Q_vmin is not None else None,
+            Q_vmax=float(Q_vmax) if Q_vmax is not None else None,
+            dpi=int(dpi),
+        )
+
+        bundle_meta["sha1_C_used_raw"] = _sha1_f32(C_used_raw)
+        bundle_meta["sha1_Q_raw"]      = _sha1_f32(Q_raw)
+
+        # （可选）保存 logits 的 hash，方便确认“同一次 forward”
+        if logits_raw is not None:
+            bundle_meta["sha1_logits_raw"] = _sha1_f32(logits_raw)
+
+        bundle_path = os.path.join(save_csv_dir, f"{csv_prefix}_bundle.npz")
+        np.savez_compressed(
+            bundle_path,
+            # raw (unsorted)
+            C_used_raw=C_used_raw,
+            C_geom_raw=C_geom_raw,
+            Q_raw=Q_raw,
+            logits_raw=logits_raw if logits_raw is not None else np.array([], dtype=np.float32),
+
+            # sorted
+            C_used_sorted=C_used_cpu,
+            C_geom_sorted=C_geom_cpu,
+            Q_sorted=Q_cpu,
+
+            # permutations
+            row_idx=row_idx.astype(np.int64),
+            col_idx=col_idx.astype(np.int64),
+
+            # (Level B) 想做“重算 cost”验证才需要：保存 feats & protos
+            # feats=batch_feats.detach().float().cpu().numpy(),
+            # protos=proto_weights.detach().float().cpu().numpy(),
+        )
+        import json
+        with open(os.path.join(save_csv_dir, f"{csv_prefix}_bundle_meta.json"), "w") as f:
+            json.dump(bundle_meta, f, indent=2)
+
+        print(f"[Debug] Saved bundle: {bundle_path}")
+        print(f"[Debug] meta sha1 C_used_raw={bundle_meta['sha1_C_used_raw'][:10]} Q_raw={bundle_meta['sha1_Q_raw'][:10]}")
+
+    return {
+        "C_used": C_used.detach(),
+        "C_geom": C_geom.detach(),
+        "Q": Q.detach(),
+        "row_idx": row_idx_t,
+        "col_idx": col_idx_t,
+        "C_used_sorted": torch.from_numpy(C_used_cpu).to(device),
+        "C_geom_sorted": torch.from_numpy(C_geom_cpu).to(device),
+        "Q_sorted": torch.from_numpy(Q_cpu).to(device),
+    }
+
+@torch.no_grad()
+def _plot_cost_matrix2(
+    batch_feats: torch.Tensor,               # [B, D]
+    proto_weights: torch.Tensor,             # [K, D]
+    *,
+    Q: torch.Tensor,                         # [B, K]  (required here)
+    logits: Optional[torch.Tensor] = None,   # [B, K] optional
+    cost_mode: str = "neg_dot",              # "neg_dot" | "sqeuclidean"
+    normalize: bool = True,                  # normalize feats/protos before dot product
+    sort_rows: str = "argmin",               # "none" | "argmin" | "mincost"
+    sort_cols: str = "mass",                 # "mass" | "usage" | "avgcost" | "none"
+    title: Optional[str] = None,
+    save_path: str = "./cost_and_q.png",
+    dpi: int = 160,
+    # C visualization clipping
+    C_vmax_percentile: Optional[float] = 99.0,
+    C_vmin_percentile: Optional[float] = 1.0,
+    # Q visualization clipping
+    Q_vmax_percentile: Optional[float] = 99.5,
+    Q_vmin_percentile: Optional[float] = 0.0,  # usually 0 makes sense for Q
+    show: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """
+    Plot side-by-side heatmaps:
+      Left: cost matrix C (geometry)
+      Right: assignment matrix Q (Sinkhorn plan)
+
+    IMPORTANT:
+      - Both plots share the SAME row/col ordering.
+      - Row ordering: derived from C (default argmin(C)) so you can see whether Q mass
+        lands on low-cost regions.
+      - Column ordering: derived from Q (default by column mass sum_i Q_ik) so both x-axes match.
+
+    Returns:
+      - C (unsorted), Q (unsorted)
+      - row_idx, col_idx (the shared ordering)
+      - C_sorted, Q_sorted (for further analysis)
+    """
+    assert batch_feats.dim() == 2, f"batch_feats must be [B,D], got {batch_feats.shape}"
+    assert proto_weights.dim() == 2, f"proto_weights must be [K,D], got {proto_weights.shape}"
+    assert Q is not None, "Q must be provided to plot Q heatmap."
+    assert Q.dim() == 2, f"Q must be [B,K], got {Q.shape}"
+
+    device = batch_feats.device
+    B, D = batch_feats.shape
+    K, D2 = proto_weights.shape
+    assert D == D2, f"Feature dim mismatch: batch {D}, protos {D2}"
+    assert Q.shape[0] == B and Q.shape[1] == K, f"Q shape {Q.shape} must match [B,K]=[{B},{K}]"
+
+    # --------------------------
+    # 1) Build C (geometry cost)
+    # --------------------------
+    if logits is not None:
+        # higher similarity => lower cost
+        C = -logits
+    else:
+        z = batch_feats
+        c = proto_weights
+
+        if normalize and cost_mode == "neg_dot":
+            z = torch.nn.functional.normalize(z, dim=1)
+            c = torch.nn.functional.normalize(c, dim=1)
+
+        if cost_mode == "neg_dot":
+            C = -(z @ c.t())  # [B,K]
+        elif cost_mode == "sqeuclidean":
+            z2 = (batch_feats ** 2).sum(dim=1, keepdim=True)            # [B,1]
+            c2 = (proto_weights ** 2).sum(dim=1, keepdim=True).t()      # [1,K]
+            sim = batch_feats @ proto_weights.t()
+            C = z2 + c2 - 2.0 * sim
+        else:
+            raise ValueError(f"Unknown cost_mode: {cost_mode}")
+
+    # to numpy for sorting & plotting
+    C_cpu = C.detach().float().cpu().numpy()      # [B,K]
+    Q_cpu = Q.detach().float().cpu().numpy()      # [B,K]
+
+    # --------------------------
+    # 2) Row sorting (from C)
+    # --------------------------
+    row_idx = np.arange(B)
+    if sort_rows == "argmin":
+        row_best = np.argmin(C_cpu, axis=1)              # [B]
+        row_minc = C_cpu[np.arange(B), row_best]         # [B]
+        row_idx = np.lexsort((row_minc, row_best))       # group by best prototype, then by cost
+    elif sort_rows == "mincost":
+        row_minc = np.min(C_cpu, axis=1)
+        row_idx = np.argsort(row_minc)
+    elif sort_rows == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown sort_rows: {sort_rows}")
+
+    C_cpu = C_cpu[row_idx, :]
+    Q_cpu = Q_cpu[row_idx, :]
+
+    # --------------------------
+    # 3) Column sorting (prefer Q-derived)
+    # --------------------------
+    col_idx = np.arange(K)
+    if sort_cols == "mass":
+        # column mass from Q
+        qmass = Q_cpu.sum(axis=0)              # [K]
+        col_idx = np.argsort(-qmass)           # descending
+    elif sort_cols == "usage":
+        # hard usage based on argmax of Q (more faithful than argmin(C) for usage)
+        hard = np.argmax(Q_cpu, axis=1)
+        usage = np.bincount(hard, minlength=K).astype(np.float32)
+        col_idx = np.argsort(-usage)
+    elif sort_cols == "avgcost":
+        col_avg = C_cpu.mean(axis=0)
+        col_idx = np.argsort(col_avg)
+    elif sort_cols == "none":
+        pass
+    else:
+        raise ValueError(f"Unknown sort_cols: {sort_cols}")
+
+    C_cpu = C_cpu[:, col_idx]
+    Q_cpu = Q_cpu[:, col_idx]
+
+    # --------------------------
+    # 4) Robust scaling helpers
+    # --------------------------
+    def _robust_vmin_vmax(mat: np.ndarray,
+                         vmin_p: Optional[float],
+                         vmax_p: Optional[float]):
+        if vmin_p is None or vmax_p is None:
+            return None, None
+        flat = mat.reshape(-1)
+        vmin = float(np.percentile(flat, vmin_p))
+        vmax = float(np.percentile(flat, vmax_p))
+        if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or (vmin >= vmax):
+            return None, None
+        return vmin, vmax
+
+    C_vmin, C_vmax = _robust_vmin_vmax(C_cpu, C_vmin_percentile, C_vmax_percentile)
+
+    # For Q, often best to keep vmin=0; vmax clipped to avoid one-hot dominance
+    if Q_vmin_percentile is None or Q_vmax_percentile is None:
+        Q_vmin, Q_vmax = None, None
+    else:
+        Q_vmin = float(np.percentile(Q_cpu.reshape(-1), Q_vmin_percentile))
+        Q_vmax = float(np.percentile(Q_cpu.reshape(-1), Q_vmax_percentile))
+        if (not np.isfinite(Q_vmin)) or (not np.isfinite(Q_vmax)) or (Q_vmin >= Q_vmax):
+            Q_vmin, Q_vmax = None, None
+
+    # --------------------------
+    # 5) Plot side-by-side
+    # --------------------------
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.2))
+    ax0, ax1 = axes
+
+    im0 = ax0.imshow(C_cpu, aspect="auto", interpolation="nearest", vmin=C_vmin, vmax=C_vmax)
+    ax0.set_title("Cost matrix C (sorted)")
+    ax0.set_xlabel("Prototypes (sorted by Q)")
+    ax0.set_ylabel("Batch samples (sorted)")
+    fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+
+    im1 = ax1.imshow(Q_cpu, aspect="auto", interpolation="nearest", vmin=Q_vmin, vmax=Q_vmax)
+    ax1.set_title("Assignment matrix Q (sorted)")
+    ax1.set_xlabel("Prototypes (same order as C)")
+    ax1.set_ylabel("Batch samples (same order as C)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    if title is None:
+        title = f"C & Q (B={B}, K={K}) | rows={sort_rows}, cols={sort_cols}, mode={cost_mode}"
+    fig.suptitle(title, y=0.98)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=dpi)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+    # return tensors for further analysis
+    row_idx_t = torch.from_numpy(row_idx).to(device)
+    col_idx_t = torch.from_numpy(col_idx).to(device)
+
+    return {
+        "C": C.detach(),                                 # [B,K] original (unsorted)
+        "Q": Q.detach(),                                 # [B,K] original (unsorted)
+        "row_idx": row_idx_t,                             # [B]
+        "col_idx": col_idx_t,                             # [K]
+        "C_sorted": torch.from_numpy(C_cpu).to(device),   # [B,K] sorted view
+        "Q_sorted": torch.from_numpy(Q_cpu).to(device),   # [B,K] sorted view
+    }
+
+def plot_cost_matrix(probe_images,model,args,path,task,epoch,data_index):
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        feats, logits = model(probe_images)
+        feats = torch.nn.functional.normalize(feats, dim=1)
+    with torch.no_grad():
+        Q = distributed_sinkhorn(logits)   #    
+    result = _plot_cost_matrix(
+            batch_feats=feats,
+            proto_weights=model.prototypes.weight,
+            Q=Q,
+            logits=logits,
+            sort_rows="argmin",
+            sort_cols="mass",
+            save_path=f"{path}.png",
+            task = task,
+            epoch = epoch
+        )
+       
+    save_probe_and_prototypes(
+        probe_images,
+        model,
+        data_i=data_index,
+        task_j=task,
+        epoch_n=epoch,
+        out_dir=os.path.dirname(path),
+        Q=Q,
+        save_logits=True,
+        save_Q=True,
+    )     
+    if was_training:
+        model.train()
+    return result
+
+
+import json
+def save_probe_and_prototypes(
+    probe_images: torch.Tensor,
+    model: torch.nn.Module,
+    *,
+    data_i: int,
+    task_j: int,
+    epoch_n: int,
+    out_dir: str,
+    sample_ids: Optional[np.ndarray] = None,
+    normalize_feats: bool = True,
+    normalize_protos: bool = True,
+    # NEW:
+    Q: Optional[torch.Tensor] = None,                 # [B,K] if you already computed it
+    sinkhorn_fn=None,                                # callable(logits)->Q, optional
+    save_logits: bool = True,
+    save_Q: bool = True,
+    filename_ext: str = "npz",
+) -> str:
+    """
+    Save feats/protos/logits/Q for probe_images (data_i) and current model (task_j, epoch_n)
+    into data_{i}_task_{j}_epoch_{n}.npz
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    model_was_training = model.training
+    model.eval()
+
+    with torch.no_grad():
+        out = model(probe_images)
+        if isinstance(out, (tuple, list)) and len(out) >= 1:
+            feats = out[0]
+            logits = out[1] if (len(out) >= 2) else None
+        else:
+            feats = out
+            logits = None
+
+        if not hasattr(model, "prototypes"):
+            raise AttributeError("Model has no attribute 'prototypes' or 'prototypes.weight'.")
+        protos_obj = getattr(model, "prototypes")
+        protos = protos_obj.weight if hasattr(protos_obj, "weight") else protos_obj
+
+        feats = feats.detach()
+        protos = protos.detach()
+
+        if normalize_feats:
+            feats = torch.nn.functional.normalize(feats, dim=1)
+        if normalize_protos:
+            protos = torch.nn.functional.normalize(protos, dim=1)
+
+        # Q (assignment)
+        if save_Q:
+            if Q is None:
+                if logits is None or sinkhorn_fn is None:
+                    raise ValueError("save_Q=True but Q is None and (logits or sinkhorn_fn) is missing.")
+                Q = sinkhorn_fn(logits)
+            Q_np = Q.detach().float().cpu().numpy()
+        else:
+            Q_np = None
+
+        payload = {
+            "feats": feats.float().cpu().numpy(),     # [B,D]
+            "protos": protos.float().cpu().numpy(),   # [K,D]
+            "data_i": int(data_i),
+            "task_j": int(task_j),
+            "epoch_n": int(epoch_n),
+            "normalize_feats": bool(normalize_feats),
+            "normalize_protos": bool(normalize_protos),
+         }
+
+        if sample_ids is not None:
+            sample_ids = np.asarray(sample_ids)
+            assert sample_ids.shape[0] == payload["feats"].shape[0]
+            payload["sample_ids"] = sample_ids
+
+        if save_logits and (logits is not None):
+            payload["logits"] = logits.detach().float().cpu().numpy()  # [B,K]
+
+        if save_Q and (Q_np is not None):
+            payload["Q"] = Q_np  # [B,K]
+
+    if model_was_training:
+        model.train()
+
+    fname = f"data_{data_i}_task_{task_j}_epoch_{epoch_n}.{filename_ext}"
+    fpath = os.path.join(out_dir, fname)
+    np.savez_compressed(fpath, **payload)
+    return fpath
 
 
 if __name__ == "__main__":
