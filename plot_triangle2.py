@@ -101,7 +101,7 @@ def plot_cost_triangle(
     log_dir: str,
     out_png: str,
     *,
-    dpi: int = 1280,
+    dpi: int = 220*2,
     a4_landscape: bool = True,
     vmin_percentile: float = 1.0,
     vmax_percentile: float = 99.0,
@@ -199,7 +199,17 @@ def plot_cost_triangle(
     if "Q" not in d0:
         raise KeyError(f"Missing Q in {file_map[key]} for global proto order.")
 
-    proto_order_global = proto_order_from_qmass(d0["Q"])
+    if True:
+        # instead of: proto_order_global = proto_order_from_qmass(d0["Q"])
+
+        Q0 = d0["Q"]
+        C0 = get_C_used(d0)
+        proto_score = (Q0 * C0).sum(axis=0)   # column expectation
+        proto_order_global = np.argsort(proto_score)
+
+
+    else:
+        proto_order_global = proto_order_from_qmass(d0["Q"])
 
 
     # -----------------------------
@@ -321,9 +331,11 @@ def plot_cost_triangle(
                     ax.axis("off")
                     continue
                 Q = d["Q"]
-
+                row_order = sample_order_by_data.get(j, None)
+                if row_order is not None and Q.shape[0] == len(row_order):
+                    Q = Q[row_order]
                 Q = Q[:, proto_order_global]
-
+                
 
                 last_im = ax.imshow(
                     Q,

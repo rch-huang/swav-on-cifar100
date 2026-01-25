@@ -42,9 +42,11 @@ parser.add_argument("--max_scale_crops", type=float, default=[1.0 ], nargs="+")
 ## swav specific params #
 #########################
 parser.add_argument("--crops_for_assign", type=int, nargs="+", default=[0])
-parser.add_argument("--temperature", default=0.5, type=float)
+parser.add_argument("--temperature", default=0.2, type=float)
 parser.add_argument("--epsilon", default=0.01, type=float)
+parser.add_argument("--l2_reg", default=1, type=float)
 parser.add_argument("--sinkhorn_iterations", default=10, type=int)
+parser.add_argument("--sinkhorn_method", type=str, default="L2_regularized_POT", choices=["swav_native", "entropic_POT", "L2_regularized_POT"] )
 parser.add_argument("--feat_dim", default=128, type=int)
 parser.add_argument("--nmb_prototypes", default=250, type=int)
 parser.add_argument("--queue_length", type=int, default=0)
@@ -294,8 +296,10 @@ def build_probe_loader(args):
             download=True,
         )
          
-
-    num_samples = min(512, len(base_dataset))
+    if args.dataset == 'cifar100':
+        num_samples = min(256, len(base_dataset))
+    else:
+        num_samples = min(512, len(base_dataset))
 
  
     g = torch.Generator()
@@ -351,7 +355,7 @@ import torch
 import torch.nn.functional as F
 
 @torch.no_grad()
-def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
+def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda",epoch = -1):
     model.eval()
 
     all_logP = []
@@ -368,7 +372,7 @@ def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda"):
             # 让 P 和训练一致（如果训练里用 logits/temperature）
             logP = F.log_softmax(logits / args.temperature, dim=1)  # fp32, stable
 
-            Q = distributed_sinkhorn(logits)        # 你已在 sinkhorn 内 out.float() 更好；这里也确保 logits fp32
+            Q, Q_joint = distributed_sinkhorn(logits,epoch =epoch,total_epoch=args.epochs)        # 你已在 sinkhorn 内 out.float() 更好；这里也确保 logits fp32
 
             # 先检查 Q 是否 finite（否则后面都没意义）
             if not torch.isfinite(Q).all():
@@ -787,6 +791,7 @@ def main():
                 args,
                 prev_Q=probe_Q_prev,
                 device="cuda",
+                epoch = epoch
             ) 
             logger.info(
                 f"[Probe KL] Epoch {epoch} "
@@ -928,16 +933,16 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
                             #queue[i, :bs] = embedding[crop_id * bs: (crop_id + 1) * bs]
                             queue[i, :bs] = crop_emb
                         
-                        # check_tensor("out(before_sinkhorn)", out, logger)
-                        # q = distributed_sinkhorn(out)[-bs:]
-                        # check_tensor("Q(after_sinkhorn)", q, logger)
-
+                         
                         check_tensor("out(before_sinkhorn)", out, logger)
                         if sinkhorn_tracker != None:
                             sinkhorn_tracker.reset()
 
-                        q = distributed_sinkhorn(out,tracker=sinkhorn_tracker,clamp_min=args.clamp_min)[-bs:]
-
+                        q,q_joint = distributed_sinkhorn(out,
+                        tracker=sinkhorn_tracker,
+                        clamp_min=args.clamp_min,
+                        epoch = epoch,
+                        total_epoch = args.epochs)[-bs:]
 
                          
 
@@ -1046,9 +1051,24 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
                                     f"q_maxprob={m['q_maxprob']:.5f} q_top1_top2_gap={m['q_top1_top2_gap']:.5f} "
                                     f"q_num_used_proto={m['q_num_used_proto']:.5f}\n"
                                 )
+                            m_joint = compute_joint_metrics(q_joint)
+                            logger.info(
+                                f"[Metric] Epoch {epoch} Iter {it} "
+                                    f"H(Q_joint)={m_joint['joint_col_entropy']:.5f} "
+                                    f"minQ_joint={m_joint['joint_col_min']:.5f} maxQ_joint={m_joint['joint_col_max']:.5f} "
+                                    f"GiniQ_joint={m_joint['joint_col_gini']:.5f} used_proto_joint={m_joint['num_active_proto_joint']:.5f}\n"
+                            )
+                            with open(logfile, "a") as f:
+                                f.write(
+                                    f"[Q_joint-AfterSinkhorn] Epoch {epoch} Iter {it} "
+                                    f"joint_col_entropy={m_joint['joint_col_entropy']:.5f} "
+                                    f"joint_col_min={m_joint['joint_col_min']:.5f} joint_col_max={m_joint['joint_col_max']:.5f} "
+                                    f"joint_col_gini={m_joint['joint_col_gini']:.5f} joint_num_active_proto={m_joint['num_active_proto_joint']:.5f}\n"
+                                )
                         logger.info(f"Sinkhorn Q: std {q.std().item():.4f}, mean {q.mean().item():.4f}")
                         with open(logfile, 'a') as f:
-                            f.write(f"Task {task} Epoch {epoch} Iter {it} Sinkhorn Q: std {q.std().item():.4f}, mean {q.mean().item():.4f}\n")   
+                            f.write(f"Task {task} Epoch {epoch} Iter {it} Sinkhorn Q: std {q.std().item():.4f}, mean {q.mean().item():.4f}\n")  
+                         
 
                     subloss = 0
                     for v in np.delete(np.arange(np.sum(args.nmb_crops)), crop_id):
@@ -1093,7 +1113,7 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
                         queue[i, bs:] = queue[i, :-bs].clone()
                         queue[i, :bs] = embedding[crop_id * bs: (crop_id + 1) * bs]
 
-                    q = distributed_sinkhorn(out)[-bs:]
+                    q,_ = distributed_sinkhorn(out)[-bs:]
                 if it % 100 == 0:
                         #print q.std, q.mean()
                         logger.info(f"Sinkhorn Q: std {q.std().item():.4f}, mean {q.mean().item():.4f}")
@@ -1144,6 +1164,49 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
             )
     count_prototype_usage(all_Q_epoch, args.nmb_prototypes,epoch=epoch, logfile=logfile)
     return (epoch, losses.avg), queue
+@torch.no_grad()
+def debug_conditions(out, Q_local, Q_pot, eps):
+    # Q_*: [B,K] with rows summing to 1 (after your final Q*=B and transpose)
+
+    diff = Q_local - Q_pot
+    max_abs = diff.abs().max().item()
+    mean_abs = diff.abs().mean().item()
+    rel_max = (diff.abs() / (Q_pot.abs() + 1e-12)).max().item()
+
+    # marginals
+    B, K = Q_local.shape
+    row_err_local = (Q_local.sum(dim=1) - 1.0).abs().max().item()
+    col_target = B / K
+    col_err_local = (Q_local.sum(dim=0) - col_target).abs().max().item()
+
+    row_err_pot = (Q_pot.sum(dim=1) - 1.0).abs().max().item()
+    col_err_pot = (Q_pot.sum(dim=0) - col_target).abs().max().item()
+
+    # objective (normalize to K×B, sum=1 form)
+    C = (-out).T  # [K,B]
+    def ot_obj(Q_BK):
+        Q = (Q_BK.T / B).clamp_min(1e-30)  # [K,B], sum=1
+        return (Q * C).sum() + eps * (Q * (Q.log() - 1.0)).sum()
+
+    obj_local = ot_obj(Q_local).item()
+    obj_pot   = ot_obj(Q_pot).item()
+    obj_rel = abs(obj_local - obj_pot) / (abs(obj_pot) + 1e-12)
+
+    should_debug = (
+        (max_abs > 1e-3) or
+        (mean_abs > 1e-5) or
+        (rel_max > 1e-2) or
+        (row_err_local > 1e-3) or
+        (col_err_local > 1e-3) or
+        (obj_rel > 1e-3)
+    )
+    if should_debug == False:
+        print(f"max|ΔQ|={max_abs:.3e}, mean|ΔQ|={mean_abs:.3e}, rel_max={rel_max:.3e}")
+        print(f"row_err local={row_err_local:.3e}, pot={row_err_pot:.3e}")
+        print(f"col_err local={col_err_local:.3e}, pot={col_err_pot:.3e} (target={col_target:.6f})")
+        print(f"obj local={obj_local:.6e}, pot={obj_pot:.6e}, rel={obj_rel:.3e}")
+ 
+ 
 def tensor_stats(t):
     return (
         f"min={t.min().item():.3e}, "
@@ -1187,7 +1250,20 @@ def check_tensor(name, t, logger, max_print=5):
 
     raise RuntimeError(f"Non-finite tensor detected: {name}")
 
- 
+def compute_joint_metrics(q_joint: torch.Tensor, eps=1e-12):
+    qj = q_joint.clamp(min=eps)
+    proto_mass = qj.sum(dim=0)  # K
+
+    return {
+        "joint_col_entropy": float(-(proto_mass * proto_mass.log()).sum().item()),
+        "joint_col_min": float(proto_mass.min().item()),
+        "joint_col_max": float(proto_mass.max().item()),
+        "joint_col_gini": float(
+            1 - (proto_mass / proto_mass.sum()).pow(2).sum().item()
+        ),
+        "num_active_proto_joint": int((proto_mass > 1e-6).sum().item()),
+    }
+
 def compute_batch_metrics(q: torch.Tensor, eps: float = 1e-12) -> dict:
     """
     q: [B, K] Sinkhorn assignment
@@ -1209,8 +1285,44 @@ def compute_batch_metrics(q: torch.Tensor, eps: float = 1e-12) -> dict:
         "q_top1_top2_gap": float(top1_top2_gap.item()),
         "q_num_used_proto": float(num_used_proto),
     }
+ 
+ 
+import ot
 @torch.no_grad()
-def distributed_sinkhorn(out, tracker=None,clamp_min=None):
+def pot_sinkhorn_Q(out, epsilon):
+    """
+    out: torch.Tensor, shape [B, K]
+    returns: torch.Tensor, shape [B, K]
+    """
+
+    B, K = out.shape
+
+    # cost matrix: K × B
+    C = (-out).T.detach().cpu().numpy()
+
+    # uniform marginals
+    a = np.ones(K) / K      # prototype marginal
+    b = np.ones(B) / B      # sample marginal
+
+    # entropic OT
+    Q = ot.sinkhorn(
+        a, b, C,
+        reg=epsilon,
+        numItermax=1000,
+        stopThr=1e-9,
+        verbose=False
+    )
+
+    # POT returns K × B
+    Q = torch.from_numpy(Q).to(out.device, out.dtype)
+
+    # match your convention: columns sum to 1
+    Q = Q * B
+
+    return Q.T   # B × K
+
+@torch.no_grad()
+def computing_Q_entropic_SwAV_native_implementation(out,  tracker=None,clamp_min=None):
     if True: 
         out = out.float() # per-sample stabilization: ensure max exponent is 0 
         out = out / args.epsilon 
@@ -1229,7 +1341,7 @@ def distributed_sinkhorn(out, tracker=None,clamp_min=None):
         # make the matrix sum to 1
         Q /= torch.sum(Q)
          
-     
+    
 
     for _ in range(args.sinkhorn_iterations):
         # normalize each row: total weight per prototype must be 1/K
@@ -1242,10 +1354,135 @@ def distributed_sinkhorn(out, tracker=None,clamp_min=None):
         Q /= B
         if tracker is not None:
             tracker.update(Q)
-
+    Q_joint = Q.clone()
     Q *= B  # columns sum to 1
-    return Q.t()  # B x K
- 
+    return Q.t(), Q_joint.t()  # B x K
+@torch.no_grad()
+def computing_Q_entropic_POT_implementation(out, tracker=None, clamp_min=None):
+    # ---- keep your preprocessing ----
+    out = out.float()
+    out = out / args.epsilon
+    out = out - out.max(dim=1, keepdim=True).values
+    if clamp_min is not None:
+        out = out.clamp(min=clamp_min)
+
+    B, K = out.shape
+
+    # ---- POT cost & marginals ----
+    C = (-out).T.detach().cpu().numpy()   # K × B
+    a = np.ones(K) / K
+    b = np.ones(B) / B
+
+    # ---- POT Sinkhorn (entropic OT) ----
+    Q = ot.sinkhorn(
+        a, b, C,
+        reg=1.0,                    # already absorbed by out/epsilon
+        numItermax=args.sinkhorn_iterations,
+        stopThr=1e-9,
+        verbose=False
+    )
+
+    # ---- back to torch & match convention ----
+    Q = torch.from_numpy(Q).to(out.device, out.dtype)
+    Q = Q * B                       # columns sum to 1
+    Q = Q.T                         # B × K
+
+    if tracker is not None:
+        tracker.update(Q)
+    #check if there is negtaive elements in Q
+    if (Q < 0).any():
+        logger.error("========== Q(after_sinkhorn) NEGATIVE DETECTED ==========")
+        logger.error(
+            f"[Q] shape={tuple(Q.shape)} "
+            f"negative_ratio={(Q < 0).float().mean().item():.4f} "
+            f"min={Q.min().item():.4e}, max={Q.max().item():.4e}"
+        )
+        raise RuntimeError("Negative Q(after_sinkhorn) — analysis complete")
+
+    return Q
+
+
+def distributed_sinkhorn(out, tracker=None, clamp_min=None,epoch=-1,total_epoch=100):
+    if args.sinkhorn_method == "swav_native":
+        return computing_Q_entropic_SwAV_native_implementation(
+            out,
+            tracker=tracker,
+            clamp_min=clamp_min,
+        )
+    elif args.sinkhorn_method == "entropic_POT":
+        return computing_Q_entropic_POT_implementation(
+            out,
+            tracker=tracker,
+            clamp_min=clamp_min,
+        )
+    elif args.sinkhorn_method == "L2_regularized_POT":
+        return computing_Q_L2_regularized_POT_implementation(
+            out,
+            tracker=tracker,
+            clamp_min=clamp_min,
+            epoch=epoch,
+            total_epoch=total_epoch
+        )
+    else:
+        raise ValueError(f"Unknown sinkhorn_method: {args.sinkhorn_method}")
+
+def computing_Q_L2_regularized_POT_implementation(out, tracker=None, clamp_min=None,epoch=-1,total_epoch=100):
+     
+
+    def l2_lambda(epoch, total_epoch, l2_reg):
+        t = epoch / max(total_epoch - 1, 1)
+        return l2_reg * 0.5 * (1 - math.cos(math.pi * t))
+    out = out.float()
+    #out = out / args.epsilon
+    out = out - out.max(dim=1, keepdim=True).values
+    if clamp_min is not None:
+        out = out.clamp(min=clamp_min)
+
+    B, K = out.shape
+
+    # ---- POT cost & marginals (unchanged) ----
+    C = (-out).T.detach().cpu().numpy()   # K × B
+    a = np.ones(K, dtype=np.float64) / K
+    b = np.ones(B, dtype=np.float64) / B
+    assert epoch >= 0, "L2 POT requires explicit epoch for lambda scheduling"
+
+    if epoch == -1:
+        cur_lambda = args.l2_reg
+    else:
+        cur_lambda = l2_lambda(
+            epoch=epoch,
+            total_epoch=total_epoch,
+            l2_reg=args.l2_reg
+        )
+
+    # ---- POT quadratic/L2-regularized OT ----
+    # POT: res = ot.solve(M, a, b, reg=..., reg_type='L2') and coupling is res.plan
+    # See ot.solve docs for reg_type='L2' quadratic regularized OT. :contentReference[oaicite:1]{index=1}
+    res = ot.solve(
+        C, a, b,
+        reg=float(cur_lambda),          # <-- your lambda for L2 regularization on Q
+        reg_type="L2",
+        max_iter=int(args.sinkhorn_iterations),
+        tol=1e-9,
+        verbose=False,
+    )
+    Q = res.plan  # K × B
+
+    # ---- back to torch & match SwAV convention (unchanged) ----
+    Q = torch.from_numpy(Q).to(out.device, out.dtype)
+    Q_joint = Q.clone()
+    Q = Q * B          # so that (after transpose) rows sum to 1
+    Q = Q.T            # B × K
+
+    # ---- safety: eliminate tiny numerical negatives (should be ~0 anyway) ----
+    # (ot.solve enforces T >= 0 in the formulation, but this guards float noise) :contentReference[oaicite:2]{index=2}
+    Q = Q.clamp_min_(0.0)
+    Q = Q / (Q.sum(dim=1, keepdim=True) + 1e-12)  # keep row-stochastic for SwAV loss
+
+    if tracker is not None:
+        tracker.update(Q)
+
+    return Q, Q_joint.t()  # B x K
 def build_cost_probe_batch(dataset, batch_size, device):
     indices = torch.randperm(len(dataset))[:batch_size]
     images = torch.stack([dataset[i][0] for i in indices])
@@ -1773,7 +2010,7 @@ def plot_cost_matrix(probe_images,model,args,path,task,epoch,data_index):
         feats, logits = model(probe_images)
         feats = torch.nn.functional.normalize(feats, dim=1)
     with torch.no_grad():
-        Q = distributed_sinkhorn(logits)   #    
+        Q,_ = distributed_sinkhorn(logits,epoch=epoch,total_epoch=args.epochs)   #    
     result = _plot_cost_matrix(
             batch_feats=feats,
             proto_weights=model.prototypes.weight,
