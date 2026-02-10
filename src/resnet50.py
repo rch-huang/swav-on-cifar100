@@ -8,7 +8,7 @@
 import torch
 import torch.nn as nn
 
-
+import torch.nn.functional as F
 def conv3x3(in_planes, out_planes, stride=1, groups=1, dilation=1):
     """3x3 convolution with padding"""
     return nn.Conv2d(
@@ -130,6 +130,7 @@ class Bottleneck(nn.Module):
 
         return out
 
+import numpy as np
 
 class ResNet(nn.Module):
     def __init__(
@@ -325,6 +326,64 @@ class ResNet(nn.Module):
             start_idx = end_idx
         return self.forward_head(output)
 
+    # =========================================================
+    # SwAV loss with externally provided Q assignments
+    # (EXACTLY matches the loss used in main_cicl.py)
+    # =========================================================
+    def swav_loss_from_q(
+        self,
+        output: torch.Tensor,
+        q_assign: dict,
+        *,
+        bs: int,
+        temperature: float,
+        nmb_crops: int,
+        crops_for_assign: list,
+    ) -> torch.Tensor:
+        """
+        Compute SwAV loss given logits and pre-computed Q assignments.
+
+        Parameters
+        ----------
+        output : Tensor
+            Logits for all crops stacked together,
+            shape [bs * nmb_crops, K].
+        q_assign : dict
+            Mapping crop_id -> q, each q has shape [bs, K].
+            q MUST be stop-gradient (as in training).
+        bs : int
+            Batch size per crop.
+        temperature : float
+            Softmax temperature (args.temperature).
+        nmb_crops : int
+            Total number of crops (sum(args.nmb_crops)).
+        crops_for_assign : list
+            Crops used to compute assignments (args.crops_for_assign).
+        """
+        if nmb_crops <= 1:
+            # output: [bs, K] (or [bs*nmb_crops, K] but nmb_crops==1)
+            crop_id = crops_for_assign[0] if len(crops_for_assign) > 0 else 0
+            q = q_assign[crop_id]  # [bs, K], stop-grad is fine
+            x = output[bs * crop_id: bs * (crop_id + 1)] / temperature  # [bs, K]
+            # This depends on x -> depends on output -> requires_grad=True
+            return -torch.mean(torch.sum(q * F.log_softmax(x, dim=1), dim=1))
+        loss = output.new_zeros(())
+
+        # identical structure to main_cicl.py training loop
+        for crop_id in crops_for_assign:
+            q = q_assign[crop_id]  # [bs, K]
+
+            subloss = output.new_zeros(())
+            for v in np.delete(np.arange(nmb_crops), crop_id):
+                x = output[bs * v: bs * (v + 1)] / temperature
+                subloss -= torch.mean(
+                    torch.sum(q * F.log_softmax(x, dim=1), dim=1)
+                )
+
+            loss += subloss / (nmb_crops - 1)
+
+        loss /= len(crops_for_assign)
+        return loss
 
 class MultiPrototypes(nn.Module):
     def __init__(self, output_dim, nmb_prototypes):

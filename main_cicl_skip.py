@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+from random import random
 import shutil
 import time
 from logging import getLogger
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.optim
 from hessian_energy_tracker import HessianEnergyTrackerSwAV
+from curvature_skip_controller import CurvatureSkipController
 # import apex
 # from apex.parallel.LARC import LARC
 CICL = True
@@ -75,7 +77,7 @@ parser.add_argument("--workers", default=0, type=int)
  
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
-parser.add_argument("--seed", type=int, default=45)
+parser.add_argument("--seed", type=int, default=47)
 parser.add_argument("--clamp_min", type=float, default=-50.0)
 parser.add_argument("--selected_100classes_out_of_200_for_tinyimagenet", type=str, default=None)
 parser.add_argument("--label_remap_for_tinyimagenet", type=str, default=None)
@@ -410,6 +412,51 @@ def compute_probe_kl(model, probe_loader, args, prev_Q=None, device="cuda",epoch
     return kl_q_p.item(), kl_q_t_prev.item(), Q_all.detach().cpu()
 
 
+@torch.no_grad()
+def eval_swav_loss_on_loader(model, loader, args, device="cuda", max_batches=20, epoch=-1):
+    '''
+    Evaluate SwAV loss (no grad) on a given loader (e.g., previous-task data).
+    Uses the same distributed_sinkhorn + swav_loss_from_q as training.
+    '''
+    model.eval()
+    losses = []
+    with torch.no_grad():
+    #if True:
+        for bi, inputs in enumerate(loader):
+            if bi >= max_batches:
+                break
+            
+            _, out = model(inputs)
+            bs = inputs[0].size(0)
+
+            q_assign = {}
+            out_det = out.detach().float()
+            for crop_id in args.crops_for_assign:
+                logits = out_det[bs * crop_id: bs * (crop_id + 1)]
+                q, _ = distributed_sinkhorn(
+                    logits,
+                    tracker=None,
+                    clamp_min=args.clamp_min,
+                    epoch=epoch,
+                    total_epoch=args.epochs,
+                )
+                q_assign[crop_id] = q[-bs:].contiguous()
+
+            loss = model.swav_loss_from_q(
+                output=out.float(),
+                q_assign=q_assign,
+                bs=bs,
+                temperature=args.temperature,
+                nmb_crops=int(np.sum(args.nmb_crops)),
+                crops_for_assign=args.crops_for_assign,
+            )
+            losses.append(float(loss.item()))
+    model.train()
+    if len(losses) == 0:
+        return float("nan")
+    return float(sum(losses) / len(losses))
+
+
 def main():
     global args
     args = parser.parse_args()
@@ -419,8 +466,8 @@ def main():
         f.write(args.__repr__()+"\n")
         f.write("save_epoch: [119]\n")
         print("file name is knn_switch_"+datestamp)
-    
     args.rank = 0
+    
     args.world_size = 1
 
     fix_random_seeds(args.seed)
@@ -434,6 +481,14 @@ def main():
             args.min_scale_crops,
             args.max_scale_crops,
             CICL=CICL
+        )
+        val_dataset = MultiCropDataset(
+            args.size_crops,
+            args.nmb_crops,
+            args.min_scale_crops,
+            args.max_scale_crops,
+            CICL=CICL,
+            train=False
         )
     if args.dataset == "food101":
         from src.multicropfood101 import MultiCropDataset, TaskSubset
@@ -456,12 +511,15 @@ def main():
         args.selected_100classes_out_of_200_for_tinyimagenet = train_dataset.selected_100classes_out_of_200_for_tinyimagenet
         args.label_remap_for_tinyimagenet = train_dataset.class_map
     train_loaders = []
+    val_loaders = []
     train_loader = None
+    val_loader = None
     task_class_lists = []
      
     if CICL:
         if args.dataset == 'cifar100':
             full_labels = np.array(train_dataset.dataset.targets)  # shape=(50000,)
+            full_labels_val = np.array(val_dataset.dataset.targets)  # shape=(10000,)
         elif args.dataset == 'tinyimagenet':
             full_labels =  train_dataset.full_selected_labels()  # shape=(100000,)
         elif args.dataset == 'food101':
@@ -485,12 +543,14 @@ def main():
             task_class_lists[1] = task_class_lists[0]
             
         task_indices_list = []
-
+        task_indices_list_for_val = []
         for class_list in task_class_lists:
             mask = np.isin(full_labels, class_list)
             indices = np.where(mask)[0]
             task_indices_list.append(indices)
-        
+            mask_val = np.isin(full_labels_val, class_list)
+            indices_val = np.where(mask_val)[0]
+            task_indices_list_for_val.append(indices_val)
          
 
         for t, indices in enumerate(task_indices_list):
@@ -504,6 +564,21 @@ def main():
                 drop_last=True,
             )
             train_loaders.append(loader)
+            print(f"Task {t}: classes {task_class_lists[t]}, samples={len(indices)}")
+        for t,indices in enumerate(task_indices_list_for_val):
+            subset = TaskSubset(val_dataset, indices)
+            loader = torch.utils.data.DataLoader(
+                subset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.workers,
+                pin_memory=True,
+                drop_last=False,
+            )
+            # for _, input in enumerate(loader):
+            #     a = len(input)
+            #     pass
+            val_loaders.append(loader)
             print(f"Task {t}: classes {task_class_lists[t]}, samples={len(indices)}")
     else:
         train_loader = torch.utils.data.DataLoader(
@@ -664,10 +739,10 @@ def main():
     save_root = os.path.join(f"log_{datestamp}", f"hessian_energy_swav")
     #save_root = os.path.join(save_root, f"hessian_energy_swav_task{task_number}")
     tracker = HessianEnergyTrackerSwAV(
-                anchor_epochs=[1,10, 20, 30, 40, 50, 60, 70, 80, 90, 100,110,118],
+                anchor_epochs=[],#[anchor for anchor in range(args.epochs)],
                 window=3,
-                top_k_theta=50,       
-                top_k_C=500,         
+                top_k_theta=80,       
+                top_k_C=800,         
                 bin_size=50,
                 save_root=save_root,
                 device="cuda",
@@ -678,14 +753,38 @@ def main():
                 total_epoch=args.epochs,
                 sinkhorn_fn=distributed_sinkhorn,  # 关键：用你训练里的那一个
             )    
-    for _task_number in range(len(train_loaders)):
+    
+     
+    skip_controller = CurvatureSkipController(
+        skip_mode="hessian",     # or "random"
+        tau_curr_c=-1,            # -1 disable; >=0 enable
+        tau_prev_c=-1,            # -1 disable; >=0 enable
+        tau_curr_theta=-1,            # -1 disable; >=0 enable
+        tau_prev_theta=-1,            # -1 disable; >=0 enable
+        m_anchor_C=-1,
+        m_anchor_theta=-1,
+        m_optimal_C=-1,
+        m_optimal_theta=-1,
+        topk_C=tracker.top_k_C,  # 你也可以自己设一个固定值，或者直接用 tracker 的那个
+        topk_theta=tracker.top_k_theta,  # 你也可以自己设一个固定值，或者直接用 tracker 的那个
+        use_theta=False,
+        use_C=False,
+        replay_skip_log=None,
+        device="cuda",
+    )
+    skip_controller = None  # disable for now
+    with open(logfile, 'a') as f:
+        f.write(f"Skip controller config: {skip_controller.__dict__ if skip_controller is not None else 'None'}\n") 
+        f.write(f'tracker config: {tracker.__dict__}\n')
+    for _task_number in range(min(2, len(train_loaders))):
         task_number = _task_number
-        if False:
-            if _task_number == 0:
-                task_number = 1
-            elif _task_number ==1:
-                task_number = 0
+        if task_number == 1:
+            tracker.anchor_epochs = [anchor for anchor in range(args.epochs)]
         train_loader = train_loaders[task_number]
+        if _task_number > 0:
+            previous_train_loader = train_loaders[task_number-1]
+        prev_eval_loader = train_loaders[task_number-1] if task_number >0 else None   
+        
         cost_probe_loader =  build_cost_probe_batch(train_loader.dataset, args.batch_size, device="cuda")
         cost_probe_loaders.append(cost_probe_loader)
         seen_classes.append(task_class_lists[task_number])
@@ -744,17 +843,33 @@ def main():
             
                 
             probe_batches = []
+            probe_batches_previous_task = []
             for i, (inputs, _) in enumerate(train_loader):
                 print(type(inputs), len(inputs), inputs[0].shape, inputs[1].shape)
                 inputs_small = inputs[:32]
                 print(inputs_small[0].shape, inputs_small[1].shape)
                 probe_batches.append(inputs_small)
                 if i == 0:   
-                    break   
-            tracker.start_task(model, probe_batches, epoch0=0,task=task_number)
+                    break
+            if _task_number > 0:   
+                for i, (inputs, _) in enumerate(previous_train_loader):
+                    inputs_small = inputs[:32]
+                    probe_batches_previous_task.append(inputs_small)
+                    if i == 0:   
+                        break
+            else:
+                    probe_batches_previous_task = None
+            tracker.start_task(model, probe_batches, probe_batches_previous_task, epoch0=0,task=task_number)
+            if skip_controller is not None:
+                skip_controller.start_task(task=task_number, tracker=tracker)
         for epoch in range(0, args.epochs):
              
             proto_hash_ref = tensor_hash(model.prototypes.weight.detach())
+            if prev_eval_loader is not None:
+                prev_loss = eval_swav_loss_on_loader(model, prev_eval_loader, args, device="cuda", max_batches=20, epoch=epoch)
+                with open(logfile, 'a') as f:
+                    f.write(f"[PrevTaskLoss] BEFORE task={task_number} epoch={epoch} prev_task=0 swav_loss={prev_loss:.6f}\n")
+                logger.info(f"[PrevTaskLoss] BEFORE task={task_number} epoch={epoch} prev_task=0 swav_loss={prev_loss:.6f}")
 
             if epoch in get_knneval_epoch_from_switch(datestamp) or 0 in get_knneval_epoch_from_switch(datestamp):
                 for cost_probe_loader_idx in range(len(cost_probe_loaders)):
@@ -789,7 +904,9 @@ def main():
                     args.queue_length,
                     args.feat_dim,
                 ).cuda()
-            
+            if skip_controller is not None:
+                skip_controller.start_epoch(task=task_number, epoch=epoch, total_steps=len(train_loader),tracker=tracker)
+
             # train the network
             scores, queue = train(train_loader, 
                                         model,
@@ -801,9 +918,21 @@ def main():
                                         lr_schedule,
                                         queue,
                                         logfile=logfile,
-                                        sinkhorn_tracker = sinkhorn_tracker,hessian_tracker = tracker)
+                                        sinkhorn_tracker = sinkhorn_tracker,hessian_tracker = tracker, skip_controller=skip_controller)
             training_stats.update(scores)
             tracker.after_epoch(epoch,model,task_number)
+            if skip_controller is not None:
+                skip_controller.end_epoch()
+            # if epoch == args.epochs - 1:
+            #      tracker.end_task()
+
+            if epoch == args.epochs - 1:
+                 
+                prev_loss = eval_swav_loss_on_loader(model, train_loader, args, device="cuda", max_batches=20, epoch=epoch)
+                with open(logfile, 'a') as f:
+                    f.write(f"[PrevTaskLoss] AFTER task={task_number} epoch={epoch} prev_task=0 swav_loss={prev_loss:.6f}\n")
+                logger.info(f"[PrevTaskLoss] AFTER task={task_number} epoch={epoch} prev_task=0 swav_loss={prev_loss:.6f}")
+
             #if epoch >= 40:
             #    print(torch.cuda.memory_summary())
             with open(logfile, 'a') as f:
@@ -856,7 +985,7 @@ def tensor_hash(x):
     return hashlib.md5(x.cpu().numpy().tobytes()).hexdigest()
 from torch.amp import autocast, GradScaler
 q_assign_test = {}
-def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, queue,logfile='train_log.txt',sinkhorn_tracker=None,hessian_tracker = None):
+def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, queue,logfile='train_log.txt',sinkhorn_tracker=None,hessian_tracker = None, skip_controller=None):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -893,6 +1022,7 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
 
                 loss = 0
                 for i, crop_id in enumerate(args.crops_for_assign):
+                     
                     with torch.no_grad():
                         out = output[bs * crop_id: bs * (crop_id + 1)].detach()
                         check_tensor("out(before_queue)", out, logger)
@@ -1089,22 +1219,7 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
                         subloss -= torch.mean(torch.sum(q * F.log_softmax(x, dim=1), dim=1))
                     loss += subloss / (np.sum(args.nmb_crops) - 1)
                 loss /= len(args.crops_for_assign)
-                if epoch == 0  and False  :
-                    loss_new = model.swav_loss_from_q(
-                        output=output,
-                        q_assign=q_assign_test,
-                        bs=bs,
-                        temperature=args.temperature,
-                        nmb_crops=int(np.sum(args.nmb_crops)),
-                        crops_for_assign=args.crops_for_assign,
-                    )
-
-                    print(
-                        "[SANITY CHECK]",
-                        "loss_old =", loss.item(),
-                        "loss_new =", loss_new.item(),
-                        "abs diff =", abs(loss.item() - loss_new.item()),
-                    )
+                 
                 if not torch.isfinite(loss):
                     logger.info("Loss is NaN/Inf — dumping diagnostics and stopping.")
                     # dump out_all min/max, scaled.max, mm_part stats, queue stats, etc.
@@ -1129,16 +1244,71 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
                 for name, p in model.named_parameters():
                     if "prototypes" in name:
                         p.grad = None
+
+            # -----------------------------
+            # Curvature-aware step skipping (after backward, before optimizer step)
+            # Rule: ratio = ||U^T g||^2 / ||g||^2  (g: current gradient for chosen block)
+            if skip_controller is not None:
+                skip_blocks, skip_stats = skip_controller.should_skip(
+                    task=task,
+                    epoch=epoch,
+                    step=it,
+                    model=model,
+                )
+                skip_stats["skip_decision"] = False  # default to no skip
+                if len(skip_blocks) > 0:
+                    if True:
+                        anchor_ratio = skip_stats["theta/optimal_ratio"]
+                        anchor_tau = skip_stats["theta/optimal_tau"]
+                        eps = 1e-12
+                        tau = max(anchor_tau, eps)
+
+                        r = max(0.0, (anchor_ratio - tau) / tau)   # 相对超出比例
+                        p_max = 0.7
+
+                        k = 2.0  # 斜率/激进程度（下面给你如何定）
+                        p_skip = p_max * (1.0 - math.exp(-k * r))
+
+                        skip = np.random.rand() < p_skip
+
+
+                        skip_stats["skip_decision"] = skip   
+                    # ---- block-wise gradient masking ----
+                    if "C" in skip_blocks and skip:
+                        for name, p in model.named_parameters():
+                            if "prototypes" in name:
+                                p.grad = None
+
+                    if "theta" in skip_blocks and skip:
+                        for name, p in model.named_parameters():
+                            if "prototypes" not in name:
+                                p.grad = None
+
+                    # logging (optional)
+                    if skip_blocks:
+                        with open(logfile, "a") as f:
+                            f.write(
+                                f"[CurvSkip] task={task} epoch={epoch} iter={it} "
+                                f"skip_blocks={sorted(skip_blocks)}\n"
+                                f"skip_stats={skip_stats}\n"
+                            )               
+                print(f"[CurvSkip]   iter={it} {skip_stats}")
+            # ---- ALWAYS step optimizer & scaler ----
             scaler.step(optimizer)
             scaler.update()
+
+            # ---- after_step should be AFTER optimizer.step ----
+            hessian_tracker.after_step(task, epoch, it, model)
+
+
         else:
             assert False, "FP16 training is currently required for Sinkhorn stability. Remove this assertion if you want to run in FP32 (not recommended)."
         losses.update(loss.item(), inputs[0].size(0))
         batch_time.update(time.time() - end)
         end = time.time()
-        hessian_tracker.after_step(task, epoch, it, model)
+         
 
-        if args.rank ==0 and it % 10 == 0:
+        if it % 10 == 0:
             with open(logfile, 'a') as f:
                 f.write(f"Epoch {epoch} Iter {it} Loss: {loss.item():.4f}\n")
             logger.info(

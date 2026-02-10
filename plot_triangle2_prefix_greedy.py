@@ -69,14 +69,104 @@ def proto_order_from_qmass(Q: np.ndarray) -> np.ndarray:
 
 def row_order_from_C_argmin(C_used: np.ndarray) -> np.ndarray:
     """
-    Row order identical to training-time sort_rows="argmin":
-    primary: argmin prototype
-    secondary: min cost
+    Row ordering designed to *reveal* sample–prototype alignment under a FIXED prototype order
+    (the x-axis / columns).
+
+    This implements the user's "progressive prefix" greedy idea:
+
+      - Keep prototype (column) order fixed (C_used columns are already permuted to that order).
+      - Sweep prototypes from left to right in blocks of size `step`.
+      - At each prefix end p (0..p), take a quota of remaining samples whose best similarity to
+        the prefix is highest, and append them to the row order.
+      - Within the selected chunk, order samples by their best-matching prototype index
+        (so ideal data yields a diagonal / diagonal-block appearance), then by match strength.
+
+    IMPORTANT:
+      - This function assumes **columns of C_used already match the desired prototype order**.
+      - Use with C_used = -logits (smaller is better). Similarity is taken as S = -C_used.
     """
-    B = C_used.shape[0]
-    best = np.argmin(C_used, axis=1)
-    minc = C_used[np.arange(B), best]
-    return np.lexsort((minc, best)).astype(np.int64)
+    C_used = np.asarray(C_used, dtype=np.float32)
+    if C_used.ndim != 2:
+        raise ValueError(f"C_used must be 2D, got {C_used.ndim}D")
+    B, K = C_used.shape
+    if B == 0:
+        return np.zeros((0,), dtype=np.int64)
+    if K == 0:
+        return np.arange(B, dtype=np.int64)
+
+    # Similarity (larger is better)
+    S = -C_used  # [B, K]
+
+    # Choose a small, safe step without adding new function parameters.
+    # - small enough to show structure
+    # - not too small to avoid excessive iterations for large K
+    step = max(1, min(32, K // 20 if K >= 20 else 1))
+
+    remaining = np.ones(B, dtype=bool)
+    order: List[int] = []
+
+    # Track best similarity and best prototype index over the current prefix for ALL samples.
+    best_sim = np.full(B, -np.inf, dtype=np.float32)
+    best_k = np.full(B, -1, dtype=np.int64)
+
+    p_prev = 0
+    p = 0
+    while p < K:
+        p = min(K, p + step)
+
+        # Update prefix-best with only the newly added block [p_prev, p)
+        block = S[:, p_prev:p]  # [B, step']
+        # Handle possible empty block (shouldn't happen)
+        if block.shape[1] > 0:
+            block_best_sim = block.max(axis=1)
+            block_best_k = block.argmax(axis=1) + p_prev
+            improve = block_best_sim > best_sim
+            best_sim[improve] = block_best_sim[improve]
+            best_k[improve] = block_best_k[improve]
+
+        # Quota: by prefix coverage (ideal uniform => roughly linear fill)
+        target_cum = int(round(B * (p / K)))
+        need = target_cum - len(order)
+        if need <= 0:
+            p_prev = p
+            continue
+
+        rem_idx = np.flatnonzero(remaining)
+        if rem_idx.size == 0:
+            break
+        need = min(need, rem_idx.size)
+
+        rem_scores = best_sim[rem_idx]
+
+        # Select top-need by best similarity to current prefix
+        if need < rem_idx.size:
+            top_pos = np.argpartition(-rem_scores, need - 1)[:need]
+            sel = rem_idx[top_pos]
+        else:
+            sel = rem_idx
+
+        # Within selected, sort by (best prototype index within prefix, -best similarity)
+        sel_bestk = best_k[sel]
+        sel_bests = best_sim[sel]
+        within = np.lexsort((-sel_bests, sel_bestk))
+        sel_sorted = sel[within]
+
+        order.extend(sel_sorted.tolist())
+        remaining[sel_sorted] = False
+
+        p_prev = p
+
+    # Append any leftovers (rare; mostly due to rounding / edge cases)
+    rem_idx = np.flatnonzero(remaining)
+    if rem_idx.size > 0:
+        # Use global best over all prototypes as a final tie-breaker
+        # (still under fixed column order)
+        rem_bestk = S[rem_idx].argmax(axis=1)
+        rem_bests = S[rem_idx, rem_bestk]
+        rem_sorted = rem_idx[np.lexsort((-rem_bests, rem_bestk))]
+        order.extend(rem_sorted.tolist())
+
+    return np.asarray(order, dtype=np.int64)
 
 
 def get_C_used(d: Dict[str, Any]) -> np.ndarray:
@@ -223,7 +313,11 @@ def plot_cost_triangle(
         if key not in file_map:
             continue
         d = load_npz(file_map[key])
-        sample_order_by_data[i] = row_order_from_C_argmin(get_C_used(d))
+        Cii = get_C_used(d)
+        # IMPORTANT: row order must be computed under the SAME fixed prototype order
+        # used everywhere in the triangle.
+        Cii = Cii[:, proto_order_global]
+        sample_order_by_data[i] = row_order_from_C_argmin(Cii)
 
     # -----------------------------
     # column layout: task blocks
@@ -515,6 +609,6 @@ if __name__ == "__main__":
 
     out = plot_cost_triangle(
         log_dir=log_dir,
-        out_png=log_dir+"/cost_triangle2.png",
+        out_png=log_dir+f"/cost_triangle2_{log_dir}.png",
     )
     print("Saved:", out)
