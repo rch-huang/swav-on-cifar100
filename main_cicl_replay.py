@@ -741,8 +741,7 @@ def main():
     #save_root = os.path.join(save_root, f"hessian_energy_swav_task{task_number}")
     tracker = HessianEnergyTrackerSwAV(
                 anchor_epochs=[anchor for anchor in range(args.epochs)],
-                window1=5,
-                window2=15,
+                window=3,
                 top_k_theta=80,       
                 top_k_C=800,         
                 bin_size=50,
@@ -1262,22 +1261,22 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
                         skip = False
                         for block in ['theta', 'C']:
                             for basis in ['anchor','prev_tasl_0']:
-                                # ratio_key = f"{block}/{basis}_ratio"
-                                # tau_key = f"{block}/{basis}_tau"
-                                # if ratio_key not in skip_stats or tau_key not in skip_stats:
-                                #     continue    
-                                # anchor_ratio = skip_stats["theta/anchor_ratio"]
-                                # anchor_tau = skip_stats["theta/anchor_tau"]
-                                # eps = 1e-12
-                                # tau = max(anchor_tau, eps)
+                                ratio_key = f"{block}/{basis}_ratio"
+                                tau_key = f"{block}/{basis}_tau"
+                                if ratio_key not in skip_stats or tau_key not in skip_stats:
+                                    continue    
+                                anchor_ratio = skip_stats["theta/anchor_ratio"]
+                                anchor_tau = skip_stats["theta/anchor_tau"]
+                                eps = 1e-12
+                                tau = max(anchor_tau, eps)
 
-                                # r = max(0.0, (anchor_ratio - tau) / tau)    
-                                # p_max = 0.5
+                                r = max(0.0, (anchor_ratio - tau) / tau)    
+                                p_max = 0.5
 
-                                # k = 2.0  
-                                # p_skip = p_max * (1.0 - math.exp(-k * r))
+                                k = 2.0  
+                                p_skip = p_max * (1.0 - math.exp(-k * r))
 
-                                skip = (np.random.rand() < 0.8) or skip
+                                skip = (np.random.rand() < p_skip) or skip
                         skip_stats["skip_decision"] = skip   
                     # ---- block-wise gradient masking ----
                     if "C" in skip_blocks and skip:

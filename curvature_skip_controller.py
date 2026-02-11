@@ -370,7 +370,16 @@ class CurvatureSkipController:
                 tau_curr = self.tau_curr_c
                 tau_prev = self.tau_prev_c
 
-            w_now = _flatten_params_cpu(params).to(device=device, dtype=torch.float32)
+            #w_now = _flatten_params_cpu(params).to(device=device, dtype=torch.float32)
+            # STEP-BASED: use current gradients instead of parameter difference
+            grads = []
+            for p in params:
+                if p.grad is None:
+                    continue
+                grads.append(p.grad.detach().reshape(-1))
+            if len(grads) == 0:
+                continue
+            delta = torch.cat(grads).to(device=device, dtype=torch.float32)
             block_triggered = False
 
             # =========================================================
@@ -385,7 +394,7 @@ class CurvatureSkipController:
                     if k_big is not None:
                         U = U[:, :min(k_big, U.shape[1])]
 
-                    delta = w_now - w_ref
+                    #delta = w_now - w_ref
                     proj = U.T @ delta
                     energy = proj.pow(2)
 
@@ -413,7 +422,7 @@ class CurvatureSkipController:
                     if k_big is not None:
                         U = U[:, :min(k_big, U.shape[1])]
 
-                    delta = w_now - w_star
+                    #delta = w_now - w_star
                     proj = U.T @ delta
                     energy = proj.pow(2)
 

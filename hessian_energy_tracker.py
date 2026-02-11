@@ -202,7 +202,8 @@ class HessianEnergyTrackerSwAV:
         self,
         *,
         anchor_epochs: List[int],
-        window: int,
+        window1: int,
+        window2: int,
         top_k_theta: int = 50,
         top_k_C: int = 500,
         bin_size: int = 50,
@@ -223,7 +224,8 @@ class HessianEnergyTrackerSwAV:
         lanczos_seed: int = 0,
     ):
         self.anchor_epochs = set(anchor_epochs)
-        self.window = int(window)
+        self.window1 = int(window1)
+        self.window2 = int(window2)
         self.top_k_theta = int(top_k_theta)
         self.top_k_C = int(top_k_C)
         self.bin_size = int(bin_size)
@@ -234,7 +236,8 @@ class HessianEnergyTrackerSwAV:
         self._task_optimal: Dict[int, Dict[str, torch.Tensor]] = {}  # task -> block -> flat cpu tensor
         self._task_optimal_epoch: Dict[int, int] = {}
         self._task_optimal_basis: Dict[int, Dict[str, Any]] = {}  # task -> block -> {params,eigvals,eigvecs,top_k,epoch}
-        self.window_steps = int(window)  # interpret window as number of STEPS after anchor (in next epoch)
+        self.window_steps1 = int(window1)  # interpret window as number of STEPS after anchor (in next epoch)
+        self.window_steps2 = int(window2)
 
         self.crops_for_assign = list(crops_for_assign)
         self.nmb_crops = int(nmb_crops)
@@ -341,17 +344,29 @@ class HessianEnergyTrackerSwAV:
         for a in list(self._anchors.keys()):
             if epoch != a + 1:
                 continue
-            if step < 0 or step >= self.window_steps:
+            if step < 0 or step >= self.window_steps1:
                 continue
              
-            is_window_end = (step == self.window_steps - 1)
-            is_plot_epoch = (epoch % self.plot_every == 0)
+            is_window1_end = (step == self.window_steps1 - 1)
+            #is_plot_epoch = (epoch % self.plot_every == 0)
 
-            if not (is_window_end and is_plot_epoch):
+            if not is_window1_end: #and is_plot_epoch):
                 continue
 
-            self._process_step_delta(task=task, epoch=epoch, step=step, anchor_epoch=a, model=model)
+            self._process_step_delta(task=task, epoch=epoch, step=step, anchor_epoch=a, model=model,window_suffix="window1")
+        for a in list(self._anchors.keys()):
+            if epoch != a + 1:
+                continue
+            if step < 0 or step >= self.window_steps2:
+                continue
+             
+            is_window2_end = (step == self.window_steps2 - 1)
+            #is_plot_epoch = (epoch % self.plot_every == 0)
 
+            if not is_window2_end: #and is_plot_epoch):
+                continue
+
+            self._process_step_delta(task=task, epoch=epoch, step=step, anchor_epoch=a, model=model,window_suffix="window2")
         return
 
     # =========================================================
@@ -574,7 +589,7 @@ class HessianEnergyTrackerSwAV:
 
         if self.rank == 0:
             print(f"[HessianEnergyTrackerSwAV] Saved task-optimal snapshot: task={t}, epoch={epoch} -> {save_dir}")
-    def _process_step_delta(self, *, task: int, epoch: int, step: int, anchor_epoch: int, model) -> None:
+    def _process_step_delta(self, *, task: int, epoch: int, step: int, anchor_epoch: int, model, window_suffix:str) -> None:
         """
         Minimal step-level logging for stacked top-K_big eig-projection heatmaps.
 
@@ -620,6 +635,7 @@ class HessianEnergyTrackerSwAV:
                 "anchor_epoch": int(anchor_epoch),
                 "block": block,
                 "basis": "anchor",
+                "window_suffix": window_suffix,
                 "proj": proj.detach().cpu().numpy(),
                 "eigvals": lam.detach().cpu().numpy(),
                 "delta_norm2": float(delta.pow(2).sum().item()),
@@ -645,6 +661,7 @@ class HessianEnergyTrackerSwAV:
                 "anchor_epoch": int(anchor_epoch),
                 "block": block,
                 "basis": f"prev_task_{prev_task}",
+                "window_suffix": window_suffix,
                 "proj": proj_p.detach().cpu().numpy(),
                 "eigvals": lam_p.detach().cpu().numpy(),
                 "delta_norm2": float(delta_p.pow(2).sum().item()),
