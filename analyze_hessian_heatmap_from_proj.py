@@ -68,6 +68,7 @@ def filter_records(
     *,
     block: str,
     basis: str,
+    window: str,
 ) -> List[Dict[str, Any]]:
     out = []
     for r in records:
@@ -75,6 +76,8 @@ def filter_records(
             continue
         if r.get("basis") != basis:
             continue
+        if r.get("window_suffix") != window:    
+            continue        
         if "proj" not in r:
             continue
         out.append(r)
@@ -334,6 +337,7 @@ def main():
     ap.add_argument("--block", type=str, default="theta", choices=["theta", "C"])
     ap.add_argument("--basis", type=str, default="anchor")
     ap.add_argument("--topk_avg", type=int, default=10)
+    ap.add_argument("--window", type=str, default="window1")
     ap.add_argument("--m", type=int, default=20)
     ap.add_argument(
         "--energy_mode",
@@ -349,7 +353,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     all_recs = load_all_records(args.root_dir)
-    recs = filter_records(all_recs, block=args.block, basis=args.basis)
+    recs = filter_records(all_recs, block=args.block, basis=args.basis, window=args.window)
 
     if not recs:
         raise RuntimeError("No matching records found.")
