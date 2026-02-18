@@ -463,7 +463,7 @@ def main():
     args = parser.parse_args()
     with open("knn_switch_"+datestamp, 'w') as f:
         #f.write("epoch: [1,30,60,90,99,120,150,180,210,240,270,300,330,360,390,399]\n")
-        f.write("epoch: [1,10,30,60,90,119]\n")
+        f.write("epoch: [10,30,60,90,119]\n")
         f.write(args.__repr__()+"\n")
         f.write("save_epoch: [119]\n")
         print("file name is knn_switch_"+datestamp)
@@ -774,7 +774,7 @@ def main():
         replay_skip_log=None,
         device="cuda",
     )
-    skip_controller = None  # disable for now
+    #skip_controller = None  # disable for now
     with open(logfile, 'a') as f:
         f.write(f"Skip controller config: {skip_controller.__dict__ if skip_controller is not None else 'None'}\n") 
         f.write(f'tracker config: {tracker.__dict__}\n')
@@ -845,7 +845,7 @@ def main():
                 
             probe_batches = []
             probe_batches_previous_task = []
-            for i, (inputs, _) in enumerate(train_loader):
+            for i,  inputs  in enumerate(train_loader):
                 print(type(inputs), len(inputs), inputs[0].shape, inputs[1].shape)
                 inputs_small = inputs[:32]
                 print(inputs_small[0].shape, inputs_small[1].shape)
@@ -853,7 +853,7 @@ def main():
                 if i == 0:   
                     break
             if _task_number > 0:   
-                for i, (inputs, _) in enumerate(previous_train_loader):
+                for i,  inputs  in enumerate(previous_train_loader):
                     inputs_small = inputs[:32]
                     probe_batches_previous_task.append(inputs_small)
                     if i == 0:   

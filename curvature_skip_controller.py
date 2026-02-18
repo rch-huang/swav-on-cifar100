@@ -384,16 +384,13 @@ class CurvatureSkipController:
 
 
             if epoch == 3 and (step == 0 or step == 10):
-                extra = self.compute_ratio_diag_with_hvp(
+                extra = self.debug_print_strict_Mii_contrib(
                     model=model,
-                    block=block,
-                    task=t,
-                    epoch=e,
-                    step=s,
-                    epoch_for_sinkhorn=e,
-                    m_diag=m_anchor,        # 例如 250/500
-                    max_i=500,
-                    use_grad_delta=True,    # δ 用当前梯度（与你现在 controller 一致）
+                     
+                    task=t, epoch=e, step=s,
+                    m_print=250,
+                    crop_id=0,
+                    print_every=1,
                 )
                 stats[f"{block}/ratio_diag"] = extra.get("ratio_diag", None)
                 stats[f"{block}/denom_rayleigh"] = extra.get("denom_rayleigh", None)
@@ -465,6 +462,300 @@ class CurvatureSkipController:
         stats["skip_blocks"] = sorted(skip_blocks)
         stats["skipped"] = bool(skip_blocks)
         return skip_blocks, stats
+    # Put this INSIDE class CurvatureSkipController (same indentation as should_skip).
+    # Call it AFTER loss.backward() and BEFORE optimizer.step().
+    #
+    # IMPORTANT: This is the "strict" route in the sense that:
+    #   - g is computed as p - q (p = softmax(out/temperature), q = sinkhorn assignment)
+    #   - T_theta v is implemented as J_z^T (C v) (via VJP on scalar <z, C v / tau>)
+    #   - denom is computed as (T_theta g)^T H_anchor (T_theta g) using anchor HVP (NO eigs)
+    #   - M_ii is computed as (T_theta e_i)^T H_anchor (T_theta e_i) for selected i
+    #
+    # It prints:
+    #   - M_ii
+    #   - M_ii * g_i^2 contribution
+    #   - contribution / denom
+    #   - cumulative contribution / denom (over printed i)
+    #
+    # By default it selects top-|g_i| prototypes (most meaningful), size = m_print.
+
+    def debug_print_strict_Mii_contrib(
+        self,
+        *,
+        model,
+        batch = None,                 # current step batch (same format as training: tensor or list of crops)
+        task: int,
+        epoch: int,
+        step: int,
+        m_print: int = 250,     # how many prototype indices to evaluate/print
+        crop_id: int = 0,       # which crop to use for p,q,g,z
+        use_prev_epoch_anchor: bool = True,  # anchor = prev-epoch Hessian cache (must be epoch == anchor+1)
+        print_every: int = 1,   # print every k items among the selected set
+        eta: float = 1.0,       # scale factor (can absorb lr); ratios unaffected if consistent
+    ):
+        import torch
+
+        if self._tracker is None:
+            return {"ok": False, "reason": "no_tracker"}
+        if batch is None:
+            batch = getattr(self._tracker, "_probe_batches", None)
+        device = self.device if self.device is not None else next(model.parameters()).device
+        t, e, s = int(task), int(epoch), int(step)
+
+        # -----------------------------
+        # helpers (local)
+        # -----------------------------
+        def _normalize_inputs(b):
+            # accept: tensor, (tensor,y), list-of-crops, tuple-of-crops
+            if isinstance(b, (tuple, list)):
+                if len(b) == 2 and torch.is_tensor(b[0]):
+                    x = b[0]
+                else:
+                    x = b
+            else:
+                x = b
+            if torch.is_tensor(x):
+                return [x]
+            return list(x)
+
+        def _freeze_bn_stats(_model):
+            _model.train()
+            for m in _model.modules():
+                if isinstance(m, torch.nn.BatchNorm2d):
+                    m.eval()
+
+        def _split_params(_model):
+            # use the same convention as controller: "prototypes" -> C block
+            theta, C = [], []
+            for name, p in _model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if "prototypes" in name:
+                    C.append(p)
+                else:
+                    theta.append(p)
+            return {"theta": theta, "C": C}
+
+        def _flatten_params(params):
+            if len(params) == 0:
+                return torch.empty(0, device=device)
+            return torch.cat([p.detach().reshape(-1).to(device=device) for p in params], dim=0)
+
+        def _assign_flat_to_params_(params, flat_vec):
+            # in-place copy (NO grad)
+            offset = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel()
+                    p.copy_(flat_vec[offset:offset + n].view_as(p).to(device=p.device, dtype=p.dtype))
+                    offset += n
+            assert offset == flat_vec.numel()
+
+        # -----------------------------
+        # 0) pick anchor params (theta + C) from tracker cache
+        # -----------------------------
+        if use_prev_epoch_anchor:
+            # uses tracker.get_prev_epoch_hessian(epoch, block) which returns anchor at epoch-1
+            theta_info = self._tracker.get_prev_epoch_hessian(e, "theta")
+            C_info = self._tracker.get_prev_epoch_hessian(e, "C")
+        else:
+            # previous-task optimal anchor
+            theta_info = self._tracker.get_prev_task_optimal(t, "theta")
+            C_info = self._tracker.get_prev_task_optimal(t, "C")
+
+        if theta_info is None or C_info is None:
+            return {"ok": False, "reason": "missing_anchor_params_for_theta_or_C"}
+
+        theta_anchor_flat = theta_info["params"].to(device=device, dtype=torch.float32)
+        C_anchor_flat = C_info["params"].to(device=device, dtype=torch.float32)
+
+        # -----------------------------
+        # 1) Phase A @ CURRENT params: compute p, q, g = mean(p-q),
+        #    and build v_i = T_theta e_i and v_g = T_theta g (DETACH THEM)
+        #    (NO anchor swapping in this phase)
+        # -----------------------------
+        split = _split_params(model)
+        theta_params = split["theta"]
+        C_params = split["C"]
+        if len(theta_params) == 0 or len(C_params) == 0:
+            return {"ok": False, "reason": "missing_theta_or_C_params"}
+
+        # prototypes param: assume a single tensor (common SwAV); support [K,d] or [d,K]
+        P = C_params[0]
+        inputs = _normalize_inputs(batch)
+        nmb_crops_actual = len(inputs)
+        if crop_id >= nmb_crops_actual:
+            crop_id = 0
+
+        _freeze_bn_stats(model)
+        emb, out = model(inputs)
+
+        if isinstance(out, list):
+            out = out[getattr(self._tracker, "prototypes_head_index", 0)]
+        if isinstance(emb, (list, tuple)):
+            z_all = emb
+        else:
+            z_all = [emb]
+
+        bs = inputs[0].shape[0]
+        K = out.shape[1]
+        assert out.shape[0] >= bs * nmb_crops_actual, (
+            f"Logits rows {out.shape[0]} < bs*nmb_crops_actual={bs*nmb_crops_actual}."
+        )
+
+        # slice crop
+        out_crop = out[bs * crop_id: bs * (crop_id + 1)]
+        z_crop = z_all[crop_id] if crop_id < len(z_all) else z_all[0]
+        # ensure z_crop is [B,d]
+        if z_crop.dim() == 1:
+            z_crop = z_crop.view(1, -1)
+
+        # q via sinkhorn on the SAME crop logits (stop-grad), consistent with tracker
+        with torch.no_grad():
+            q_res = self._tracker.sinkhorn_fn(
+                out_crop.detach(),
+                tracker=None,
+                clamp_min=getattr(self._tracker, "clamp_min", 1e-6),
+                epoch=e,
+                total_epoch=getattr(self._tracker, "total_epoch", 1),
+            )
+            q = q_res[0] if isinstance(q_res, (tuple, list)) else q_res
+            q = q[-bs:].contiguous()  # [B,K]
+
+        # p via softmax(out/temperature)
+        temp = float(getattr(self._tracker, "temperature", 0.1))
+        p = torch.softmax(out_crop / temp, dim=1)  # [B,K]
+
+        # g = mean(p-q) (prototype-space, as requested)
+        g_vec = (p - q).mean(dim=0).detach().to(device=device, dtype=torch.float32)  # [K]
+
+        # build C matrix in "paper" orientation [d,K]
+        if P.dim() != 2:
+            return {"ok": False, "reason": f"unexpected_prototypes_shape_{tuple(P.shape)}"}
+
+        if P.shape[0] == K:   # [K,d]
+            Cmat = P.t().contiguous()  # [d,K]
+        elif P.shape[1] == K: # [d,K]
+            Cmat = P.contiguous()
+        else:
+            return {"ok": False, "reason": f"prototypes_not_compatible_with_K_{K}", "P_shape": tuple(P.shape)}
+
+        tau = float(getattr(self._tracker, "temperature", 0.1))  # SwAV often uses same "temperature" symbol; keep consistent
+        # If you prefer a distinct tau for logits scaling, replace above with getattr(self._tracker,"swav_tau", temp)
+
+        # Strict T_theta apply via VJP: v = -eta * d/dtheta < z, (C vK)/tau >
+        def _T_theta_apply(vK: torch.Tensor) -> torch.Tensor:
+            vK = vK.to(device=z_crop.device, dtype=z_crop.dtype)
+            Cv = (Cmat @ vK) / float(tau)  # [d]
+            # scalar = mean_b <z_b, Cv>
+            scalar = (z_crop * Cv.view(1, -1)).sum(dim=1).mean()
+            grads = torch.autograd.grad(
+                scalar, theta_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=False,
+            )
+            flat = torch.cat([(-eta) * g.reshape(-1) for g in grads], dim=0)
+            return flat.detach().to(device=device, dtype=torch.float32).contiguous()
+
+        # choose indices: top-|g|
+        m_use = int(min(m_print, K))
+        top_idx = torch.topk(g_vec.abs(), k=m_use, largest=True).indices  # [m_use]
+
+        # compute v_g and v_i list (detach!)
+        v_g = _T_theta_apply(g_vec)  # [|theta|] flat
+
+        v_list = []
+        gi_list = []
+        idx_list = []
+        for kk, idx in enumerate(top_idx.tolist()):
+            e_i = torch.zeros_like(g_vec)
+            e_i[idx] = 1.0
+            v_i = _T_theta_apply(e_i)
+            v_list.append(v_i)
+            gi_list.append(float(g_vec[idx].item()))
+            idx_list.append(int(idx))
+
+        # free current-graph tensors before any in-place param swap
+        del emb, out, out_crop, z_all, z_crop, p
+
+        # -----------------------------
+        # 2) Phase B @ ANCHOR params: compute H_anchor via probe loss, then HVPs
+        #    denom = v_g^T H v_g
+        #    M_ii  = v_i^T H v_i
+        # -----------------------------
+        def _rayleigh_hvp_anchor(delta_flat: torch.Tensor) -> float:
+            # swap BOTH theta and prototypes to anchor, compute probe loss, then HVP on theta block
+            backup_theta = _flatten_params(theta_params)
+            backup_C = _flatten_params(C_params)
+
+            try:
+                _assign_flat_to_params_(theta_params, theta_anchor_flat)
+                _assign_flat_to_params_(C_params, C_anchor_flat)
+
+                # probe loss (exact SwAV) at anchor
+                loss_anchor, _san = self._tracker._probe_loss_swav(
+                    model,
+                    probe_batches=None,              # uses tracker._probe_batches
+                    epoch_for_sinkhorn=e,
+                    require_grad=True,
+                )
+
+                grads = torch.autograd.grad(loss_anchor, theta_params, create_graph=True, retain_graph=True)
+                gflat = torch.cat([g.reshape(-1) for g in grads], dim=0)
+
+                hv = torch.autograd.grad(gflat @ delta_flat, theta_params, retain_graph=False)
+                hvflat = torch.cat([h.reshape(-1) for h in hv]).detach()
+
+                return float((delta_flat * hvflat).sum().item())
+            finally:
+                _assign_flat_to_params_(theta_params, backup_theta)
+                _assign_flat_to_params_(C_params, backup_C)
+
+        denom = _rayleigh_hvp_anchor(v_g)
+
+        # -----------------------------
+        # 3) print per-i contributions you asked for
+        #    (M_ii, M_ii*g_i^2, ratio, cumulative ratio)
+        # -----------------------------
+        denom_safe = float(denom) + 1e-12
+        cum = 0.0
+
+        printed = 0
+        for kk, (idx, gi, v_i) in enumerate(zip(idx_list, gi_list, v_list)):
+            M_ii = _rayleigh_hvp_anchor(v_i)
+
+            contrib = float(M_ii) * (float(gi) ** 2)
+            ratio = contrib / denom_safe
+            cum += contrib
+            cum_ratio = cum / denom_safe
+
+            if (kk % max(int(print_every), 1)) == 0:
+                print(
+                    f"[Mii DEBUG strict] "
+                    f"i={idx:4d} | "
+                    f"M_ii={float(M_ii):.4e} | "
+                    f"g_i={float(gi):+.4e} | "
+                    f"M_ii*g_i^2={contrib:.4e} | "
+                    f"single_ratio={ratio:.4e} | "
+                    f"cumulative_ratio={cum_ratio:.4e}"
+                )
+                printed += 1
+
+        return {
+            "ok": True,
+            "task": t,
+            "epoch": e,
+            "step": s,
+            "K": int(K),
+            "m_use": int(m_use),
+            "denom": float(denom),
+            "diag_sum_over_selected": float(cum),
+            "ratio_diag_over_selected": float(cum / denom_safe),
+            "indices": idx_list,
+            "g_selected": gi_list,
+            "printed": int(printed),
+        }
 
     def compute_ratio_diag_with_hvp(
         self,
