@@ -383,7 +383,7 @@ class CurvatureSkipController:
             block_triggered = False
 
 
-            if epoch == 3 and (step == 0 or step == 10):
+            if epoch-1 in [0,5,30,60,90,119] and (step == 0 or step == 10):
                 extra = self.debug_print_strict_Mii_contrib(
                     model=model,
                      
@@ -395,6 +395,7 @@ class CurvatureSkipController:
                 stats[f"{block}/ratio_diag"] = extra.get("ratio_diag", None)
                 stats[f"{block}/denom_rayleigh"] = extra.get("denom_rayleigh", None)
                 stats[f"{block}/delta_norm2_hvp"] = extra.get("delta_norm2", None)
+                stats[f"prototype_wise_debug"] = extra.get("prototype_wise_debug", None)
 
             # =========================================================
             # Rule A: previous-epoch (anchor) Hessian
@@ -498,7 +499,7 @@ class CurvatureSkipController:
         if self._tracker is None:
             return {"ok": False, "reason": "no_tracker"}
         if batch is None:
-            batch = getattr(self._tracker, "_probe_batches", None)
+            batch = getattr(self._tracker, "_probe_batches", None)[0]
         device = self.device if self.device is not None else next(model.parameters()).device
         t, e, s = int(task), int(epoch), int(step)
 
@@ -722,6 +723,7 @@ class CurvatureSkipController:
         cum = 0.0
 
         printed = 0
+        prototype_wise_debug = []
         for kk, (idx, gi, v_i) in enumerate(zip(idx_list, gi_list, v_list)):
             M_ii = _rayleigh_hvp_anchor(v_i)
 
@@ -740,6 +742,14 @@ class CurvatureSkipController:
                     f"single_ratio={ratio:.4e} | "
                     f"cumulative_ratio={cum_ratio:.4e}"
                 )
+                prototype_wise_debug.append({
+                    "index": int(idx),
+                    "M_ii": float(M_ii),
+                    "g_i": float(gi),
+                    "contrib": contrib,
+                    "single_ratio": ratio,
+                    "cumulative_ratio": cum_ratio,
+                })
                 printed += 1
 
         return {
@@ -754,6 +764,7 @@ class CurvatureSkipController:
             "ratio_diag_over_selected": float(cum / denom_safe),
             "indices": idx_list,
             "g_selected": gi_list,
+            "prototype_wise_debug": prototype_wise_debug,
             "printed": int(printed),
         }
 

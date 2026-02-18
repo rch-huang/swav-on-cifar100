@@ -1060,6 +1060,10 @@ class HessianEnergyTrackerSwAV:
             if self.lanczos_reorth and k > 0:
                 coeff = Q[:, :k].T @ z
                 z = z - Q[:, :k] @ coeff
+                # coeff = (Q[:, :k].to(torch.float32).T @ z.to(torch.float32))
+            
+                # # z = z - Q[:, :k] @ coeff
+                # z = z - (Q[:, :k].to(torch.float32) @ coeff)
 
             b = z.norm()
             beta[k] = b

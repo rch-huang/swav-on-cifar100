@@ -740,7 +740,7 @@ def main():
     save_root = os.path.join(f"log_{datestamp}", f"hessian_energy_swav")
     #save_root = os.path.join(save_root, f"hessian_energy_swav_task{task_number}")
     tracker = HessianEnergyTrackerSwAV(
-                anchor_epochs=[2,5],#[anchor for anchor in range(args.epochs)],
+                anchor_epochs=[0,5,30,60,90,119],#[anchor for anchor in range(args.epochs)],
                 window1=5,
                 window2=15,
                 top_k_theta=80,       
@@ -847,14 +847,16 @@ def main():
             probe_batches_previous_task = []
             for i,  inputs  in enumerate(train_loader):
                 print(type(inputs), len(inputs), inputs[0].shape, inputs[1].shape)
-                inputs_small = inputs[:32]
+                x1, x2 = inputs
+                inputs_small = (x1[:128].contiguous(), x2[:128].contiguous())
                 print(inputs_small[0].shape, inputs_small[1].shape)
                 probe_batches.append(inputs_small)
                 if i == 0:   
                     break
             if _task_number > 0:   
                 for i,  inputs  in enumerate(previous_train_loader):
-                    inputs_small = inputs[:32]
+                    x1, x2 = inputs
+                    inputs_small = (x1[:128].contiguous(), x2[:128].contiguous())
                     probe_batches_previous_task.append(inputs_small)
                     if i == 0:   
                         break
