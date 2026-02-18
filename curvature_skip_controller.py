@@ -382,6 +382,23 @@ class CurvatureSkipController:
             delta = torch.cat(grads).to(device=device, dtype=torch.float32)
             block_triggered = False
 
+
+            if epoch == 3 and (step == 0 or step == 10):
+                extra = self.compute_ratio_diag_with_hvp(
+                    model=model,
+                    block=block,
+                    task=t,
+                    epoch=e,
+                    step=s,
+                    epoch_for_sinkhorn=e,
+                    m_diag=m_anchor,        # 例如 250/500
+                    max_i=500,
+                    use_grad_delta=True,    # δ 用当前梯度（与你现在 controller 一致）
+                )
+                stats[f"{block}/ratio_diag"] = extra.get("ratio_diag", None)
+                stats[f"{block}/denom_rayleigh"] = extra.get("denom_rayleigh", None)
+                stats[f"{block}/delta_norm2_hvp"] = extra.get("delta_norm2", None)
+
             # =========================================================
             # Rule A: previous-epoch (anchor) Hessian
             # =========================================================
@@ -449,7 +466,356 @@ class CurvatureSkipController:
         stats["skipped"] = bool(skip_blocks)
         return skip_blocks, stats
 
+    def compute_ratio_diag_with_hvp(
+        self,
+        *,
+        model,
+        block: str,                 # "theta" or "C"
+        task: int,
+        epoch: int,
+        step: int,
+        epoch_for_sinkhorn: int,    # 用于 sinkhorn 的 epoch（通常就传当前 epoch）
+        m_diag: int = 250,          # 你要的 m（比如 250/500）
+        max_i: int = 500,           # 只算前 max_i 个 prototype 的 M_ii（避免 K 太大时爆炸）
+        use_grad_delta: bool = True,# True: δ=当前梯度(flat); False: δ=w_now-w_anchor
+        probe_batches=None,         # None 就用 tracker._probe_batches
+        crop_id_for_diag: int = 0,  # 用哪个 crop 的 logits 做 e_i 的 Jacobian pullback
+    ) -> dict:
+        """
+        在 loss.backward() 之后调用：
+        - 用 anchor 参数 + probe_batch 计算 H_anchor
+        - 用 HVP 得到 denom = δ^T H_anchor δ
+        - 计算 (近似) M_ii = (J^T e_i)^T H_anchor (J^T e_i)
+        - 用 g_i = mean_batch( d loss / d out[:,i] ) 构造 ratio_diag
 
+        返回一个 dict，你可以直接 merge 到 should_skip 的 stats 里。
+        """
+
+        assert block in ("theta", "C")
+        if self._tracker is None:
+            return {"ok": False, "reason": "no_tracker"}
+
+        device = self.device if self.device is not None else next(model.parameters()).device
+        t, e, s = int(task), int(epoch), int(step)
+
+        # -----------------------------
+        # inner helpers (全部写在函数里)
+        # -----------------------------
+        def _split_named_params_local(_model):
+            theta, C = [], []
+            for name, p in _model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if "prototypes" in name:
+                    C.append(p)
+                else:
+                    theta.append(p)
+            return {"theta": theta, "C": C}
+
+        def _flatten_params(params):
+            if len(params) == 0:
+                return torch.empty(0, device=device)
+            return torch.cat([p.detach().reshape(-1).to(device=device) for p in params], dim=0)
+
+        def _flatten_grads(params):
+            gs = []
+            for p in params:
+                if p.grad is None:
+                    continue
+                gs.append(p.grad.detach().reshape(-1))
+            if len(gs) == 0:
+                return None
+            return torch.cat(gs, dim=0).to(device=device, dtype=torch.float32)
+
+        def _assign_flat_to_params_(params, flat_vec):
+            # flat_vec: 1D tensor on device
+            offset = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel()
+                    p.copy_(flat_vec[offset:offset + n].view_as(p).to(device=p.device, dtype=p.dtype))
+                    offset += n
+            assert offset == flat_vec.numel()
+
+        def _normalize_probe_batch(batch):
+            # 复刻 tracker 的 _normalize_probe_batch 行为（最小版）
+            if isinstance(batch, (tuple, list)):
+                if len(batch) == 2:
+                    maybe_inputs, _maybe_y = batch
+                    inputs = maybe_inputs
+                else:
+                    inputs = batch
+            else:
+                inputs = batch
+
+            if torch.is_tensor(inputs):
+                return [inputs]
+            return list(inputs)
+
+        def _freeze_bn_stats(_model):
+            _model.train()
+            for m in _model.modules():
+                if isinstance(m, torch.nn.BatchNorm2d):
+                    m.eval()
+
+        def _forward_logits_and_q_assign(*, batch, require_grad: bool):
+            """
+            基于 tracker._probe_loss_swav 的逻辑：
+            emb, out = model(inputs)
+            out: [N,K] or list -> pick head
+            q_assign: no_grad sinkhorn on selected crops
+            """
+            tr = self._tracker
+            inputs = _normalize_probe_batch(batch)
+            nmb_crops_actual = len(inputs)
+
+            _freeze_bn_stats(model)
+            emb, out = model(inputs)
+
+            if isinstance(out, list):
+                out = out[getattr(tr, "prototypes_head_index", 0)]
+
+            assert out.dim() == 2, f"Expected logits [N,K], got {out.shape}"
+            bs = inputs[0].shape[0]
+            K = out.shape[1]
+
+            assert out.shape[0] >= bs * nmb_crops_actual, (
+                f"Logits rows {out.shape[0]} < bs*nmb_crops_actual={bs*nmb_crops_actual}."
+            )
+
+            crops_for_assign = getattr(tr, "crops_for_assign", [0])
+            crops_for_assign_actual = [c for c in crops_for_assign if c < nmb_crops_actual]
+            if len(crops_for_assign_actual) == 0:
+                crops_for_assign_actual = [0]
+
+            q_assign = {}
+            with torch.no_grad():
+                out_ng = out.detach()
+                for cid in crops_for_assign_actual:
+                    logits_crop = out_ng[bs * cid: bs * (cid + 1)]
+                    q_res = tr.sinkhorn_fn(
+                        logits_crop,
+                        tracker=None,
+                        clamp_min=getattr(tr, "clamp_min", 1e-6),
+                        epoch=epoch_for_sinkhorn,
+                        total_epoch=getattr(tr, "total_epoch", 1),
+                    )
+                    Q = q_res[0] if isinstance(q_res, (tuple, list)) else q_res
+                    Q = Q[-bs:].contiguous()
+                    q_assign[cid] = Q
+
+            if not require_grad:
+                out = out.detach()
+
+            return out, q_assign, bs, K, nmb_crops_actual, crops_for_assign_actual
+
+        def _swav_loss_from_out_q(*, out, q_assign, bs, nmb_crops_actual, crops_for_assign_actual):
+            tr = self._tracker
+            loss = model.swav_loss_from_q(
+                output=out,
+                q_assign=q_assign,
+                bs=bs,
+                temperature=getattr(tr, "temperature", 0.1),
+                nmb_crops=nmb_crops_actual,
+                crops_for_assign=crops_for_assign_actual,
+            )
+            if torch.isnan(loss) or torch.isinf(loss):
+                raise RuntimeError(f"[compute_ratio_diag_with_hvp] loss is NaN/Inf: {loss}")
+            return loss
+
+        def _rayleigh_hvp_at_anchor(*, delta_flat, params_list, anchor_flat):
+            """
+            返回 delta^T H(anchor) delta  (H 是 probe loss 对 params_list 的 Hessian)
+            完全走 HVP： grad(loss) -> gflat, 再 grad(gflat @ delta)
+            """
+            backup = _flatten_params(params_list)  # current params
+            try:
+                _assign_flat_to_params_(params_list, anchor_flat)
+
+                # 重新建图：probe loss (requires_grad=True)
+                loss_anchor = None
+                count = 0
+                for b in probe_batches_use:
+                    out, q_assign, bs, K, nmb_crops_actual, crops_for_assign_actual = _forward_logits_and_q_assign(
+                        batch=b,
+                        require_grad=True,
+                    )
+                    loss_b = _swav_loss_from_out_q(
+                        out=out,
+                        q_assign=q_assign,
+                        bs=bs,
+                        nmb_crops_actual=nmb_crops_actual,
+                        crops_for_assign_actual=crops_for_assign_actual,
+                    )
+                    loss_anchor = loss_b if loss_anchor is None else (loss_anchor + loss_b)
+                    count += 1
+                loss_anchor = loss_anchor / max(count, 1)
+
+                grads = torch.autograd.grad(loss_anchor, params_list, create_graph=True, retain_graph=True)
+                gflat = torch.cat([g.reshape(-1) for g in grads])
+
+                hv = torch.autograd.grad(gflat @ delta_flat, params_list, retain_graph=False)
+                hvflat = torch.cat([h.reshape(-1) for h in hv]).detach()
+
+                return float((delta_flat * hvflat).sum().item())
+            finally:
+                _assign_flat_to_params_(params_list, backup)
+
+        # -----------------------------
+        # 1) get anchor flat params
+        # -----------------------------
+        ainfo = self._tracker.get_prev_epoch_hessian(int(epoch), block)
+        if ainfo is None:
+            return {"ok": False, "reason": f"no_anchor_basis_for_{block}"}
+
+        anchor_flat = ainfo["params"].to(device=device, dtype=torch.float32)
+
+        # -----------------------------
+        # 2) choose params list for block and build delta
+        # -----------------------------
+        split = _split_named_params_local(model)
+        params_list = split.get(block, [])
+        if len(params_list) == 0:
+            return {"ok": False, "reason": f"no_params_in_block_{block}"}
+
+        if probe_batches is None:
+            probe_batches_use = getattr(self._tracker, "_probe_batches", None)
+        else:
+            probe_batches_use = probe_batches
+        if probe_batches_use is None or len(probe_batches_use) == 0:
+            return {"ok": False, "reason": "no_probe_batches"}
+
+        if use_grad_delta:
+            delta_flat = _flatten_grads(params_list)
+            if delta_flat is None:
+                return {"ok": False, "reason": "no_grads_for_delta"}
+            delta_flat = delta_flat.to(device=device, dtype=torch.float32).contiguous()
+        else:
+            w_now = _flatten_params(params_list).to(device=device, dtype=torch.float32)
+            delta_flat = (w_now - anchor_flat).contiguous()
+
+        # -----------------------------
+        # 3) denom = delta^T H_anchor delta  (HVP, no eigs)
+        # -----------------------------
+        denom_rayleigh = _rayleigh_hvp_at_anchor(
+            delta_flat=delta_flat,
+            params_list=params_list,
+            anchor_flat=anchor_flat,
+        )
+
+        # -----------------------------
+        # 4) compute g (prototype-space signal) from CURRENT params:
+        #    g_i := mean_batch( d loss / d out[:,i] ) on one probe batch
+        # -----------------------------
+        batch0 = probe_batches_use[0]
+        out0, q0, bs0, K0, nmb_crops0, crops_for_assign0 = _forward_logits_and_q_assign(batch=batch0, require_grad=True)
+        loss0 = _swav_loss_from_out_q(
+            out=out0,
+            q_assign=q0,
+            bs=bs0,
+            nmb_crops_actual=nmb_crops0,
+            crops_for_assign_actual=crops_for_assign0,
+        )
+
+        # dloss/dout : [N,K]
+        grad_out0 = torch.autograd.grad(loss0, out0, retain_graph=True)[0]
+        # 取你关心的 crop 部分（和 q/assign 一致地取 crop_id_for_diag）
+        out0_crop = out0[bs0 * crop_id_for_diag: bs0 * (crop_id_for_diag + 1)]
+        grad0_crop = grad_out0[bs0 * crop_id_for_diag: bs0 * (crop_id_for_diag + 1)]
+
+        # prototype vector g: [K]
+        g_vec = grad0_crop.mean(dim=0).detach().to(device=device, dtype=torch.float32)
+
+        # -----------------------------
+        # 5) for i=0..max_i-1:
+        #    v_i = T e_i  (工程可实现版：J^T e_i = grad(mean(out[:,i])) wrt params_list)
+        #    M_ii = v_i^T H_anchor v_i (again via HVP at anchor)
+        # -----------------------------
+        K_eff = int(min(K0, max_i))
+        M_diag = torch.zeros(K_eff, device=device, dtype=torch.float32)
+
+        # 注意：这里的 v_i 用的是当前 params 下的 out0_crop（即 J 在当前点）
+        # 你如果想用 anchor 点的 J，把 out0/out0_crop 的 forward 放到 anchor 参数下做即可（代价更大）
+        prototype_wise_debug = []
+        for i in range(K_eff):
+            # scalar = mean(out[:,i])  -> grad wrt params gives J^T e_i
+            scalar = out0_crop[:, i].mean()
+            grads_i = torch.autograd.grad(scalar, params_list, retain_graph=True, create_graph=False, allow_unused=True)
+            v_i = []
+            for g in grads_i:
+                if g is None:
+                    continue
+                v_i.append(g.reshape(-1))
+            if len(v_i) == 0:
+                M_diag[i] = 0.0
+                continue
+            v_i_flat = torch.cat(v_i, dim=0).detach().to(device=device, dtype=torch.float32).contiguous()
+
+            # M_ii = v_i^T H_anchor v_i
+            M_ii = _rayleigh_hvp_at_anchor(
+                delta_flat=v_i_flat,
+                params_list=params_list,
+                anchor_flat=anchor_flat,
+            )
+            M_diag[i] = float(M_ii)
+            if True:
+                single_ratio = M_diag[i] / (denom_rayleigh + 1e-12)
+
+                # 如果你还乘 g_i^2 权重
+                weighted_i = (g_vec[i].item() ** 2) * M_diag[i]
+                weighted_ratio = weighted_i / (denom_rayleigh + 1e-12)
+
+                cum_weighted += weighted_i
+                cum_ratio = cum_weighted / (denom_rayleigh + 1e-12)
+
+                print(
+                    f"[M_ii DEBUG] i={i:4d} | "
+                    f"M_ii={M_diag[i]:.4e} | "
+                    f"single_ratio={single_ratio:.4e} | "
+                    f"weighted_ratio={weighted_ratio:.4e} | "
+                    f"cumulative_weighted_ratio={cum_ratio:.4e}"
+                )
+                prototype_wise_debug.append({
+                    "i": i,
+                    "M_ii": M_diag[i].item(),
+                    "g_i": g_vec[i].item(),
+                    "g_i^2 * M_ii": weighted_i,
+                    "single_ratio": single_ratio,
+                    "weighted_ratio": weighted_ratio,
+                    "cumulative_weighted_ratio": cum_ratio,
+                })
+
+        # -----------------------------
+        # 6) ratio_diag(m): sum_{i<m} g_i^2 M_ii / sum_i g_i^2 M_ii
+        # -----------------------------
+        g2 = (g_vec[:K_eff] ** 2)
+        weighted = g2 * M_diag
+        total = float(weighted.sum().item()) + 1e-12
+        m_use = int(min(m_diag, K_eff))
+        top = float(weighted[:m_use].sum().item())
+        ratio_diag = top / total
+
+        # pack stats
+        return {
+            "ok": True,
+            "block": block,
+            "task": t,
+            "epoch": e,
+            "step": s,
+            "denom_rayleigh": float(denom_rayleigh),
+            "delta_norm2": float(delta_flat.pow(2).sum().item()),
+            "K": int(K0),
+            "K_eff": int(K_eff),
+            "m_diag": int(m_use),
+            "ratio_diag": float(ratio_diag),
+            "prototype_wise_debug": prototype_wise_debug,
+            # debug payload (你要可视化/验证就打开；默认别全存，太大)
+            # "debug": {
+            #     "g_vec_head": g_vec[: min(10, K_eff)].detach().cpu().tolist(),
+            #     "M_diag_head": M_diag[: min(10, K_eff)].detach().cpu().tolist(),
+            #     "weighted_head": weighted[: min(10, K_eff)].detach().cpu().tolist(),
+            # },
+        }
     # -------------------------
     # random baseline helpers
     # -------------------------

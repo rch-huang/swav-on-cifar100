@@ -77,7 +77,7 @@ parser.add_argument("--workers", default=0, type=int)
  
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
-parser.add_argument("--seed", type=int, default=46)
+parser.add_argument("--seed", type=int, default=45)
 parser.add_argument("--clamp_min", type=float, default=-50.0)
 parser.add_argument("--selected_100classes_out_of_200_for_tinyimagenet", type=str, default=None)
 parser.add_argument("--label_remap_for_tinyimagenet", type=str, default=None)
@@ -740,7 +740,7 @@ def main():
     save_root = os.path.join(f"log_{datestamp}", f"hessian_energy_swav")
     #save_root = os.path.join(save_root, f"hessian_energy_swav_task{task_number}")
     tracker = HessianEnergyTrackerSwAV(
-                anchor_epochs=[anchor for anchor in range(args.epochs)],
+                anchor_epochs=[2,5],#[anchor for anchor in range(args.epochs)],
                 window1=5,
                 window2=15,
                 top_k_theta=80,       
@@ -761,7 +761,7 @@ def main():
         skip_mode="hessian",     # or "random"
         tau_curr_c=-1,            # -1 disable; >=0 enable
         tau_prev_c=-1,            # -1 disable; >=0 enable
-        tau_curr_theta=0.2,            # -1 disable; >=0 enable
+        tau_curr_theta=0.3,            # -1 disable; >=0 enable
         tau_prev_theta=-1,            # -1 disable; >=0 enable
         m_anchor_C=-1,
         m_anchor_theta=10,
@@ -774,7 +774,7 @@ def main():
         replay_skip_log=None,
         device="cuda",
     )
-    #skip_controller = None  # disable for now
+    skip_controller = None  # disable for now
     with open(logfile, 'a') as f:
         f.write(f"Skip controller config: {skip_controller.__dict__ if skip_controller is not None else 'None'}\n") 
         f.write(f'tracker config: {tracker.__dict__}\n')
@@ -1241,6 +1241,7 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
         optimizer.zero_grad()
         if args.use_fp16:
             scaler.scale(loss).backward()
+            
             if iteration < args.freeze_prototypes_niters:# and _task ==0:
                 for name, p in model.named_parameters():
                     if "prototypes" in name:

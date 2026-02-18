@@ -154,8 +154,46 @@ def energy_from_lam_proj(
 
     return lam_eff * (proj ** 2)
 
-
 def build_stacked_matrix(
+    records: List[Dict[str, Any]],
+    m_stack: int,
+    energy_mode: str,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """
+    Build heights [N, m_stack].
+
+    ⭐ 新版本：
+        每个谱方向的能量除以 delta_norm2
+        严格对齐 eq.(20) 结构：
+            (u_i^T delta)^2 / ||delta||^2
+    """
+
+    N = len(records)
+    H = np.zeros((N, m_stack), dtype=np.float64)
+
+    for i, r in enumerate(records):
+        proj = np.asarray(r.get("proj", []), dtype=np.float64)
+        lam = np.asarray(r.get("eigvals", []), dtype=np.float64)
+
+        delta_norm2 = float(r.get("delta_norm2", 0.0))
+        if delta_norm2 < eps:
+            continue
+
+        if energy_mode == "dir":
+            e = proj ** 2
+        else:
+            K = min(len(proj), len(lam))
+            if K == 0:
+                continue
+            e = energy_from_lam_proj(lam[:K], proj[:K], energy_mode)
+
+        m = min(int(m_stack), len(e))
+        H[i, :m] = e[:m] / delta_norm2
+
+    return H
+
+def build_stacked_matrix2(
     records: List[Dict[str, Any]],
     m_stack: int,
     energy_mode: str,
