@@ -704,8 +704,7 @@ class CurvatureSkipController:
         )
 
         # -----------------------------
-        # 4) compute g (prototype-space signal) from CURRENT params:
-        #    g_i := mean_batch( d loss / d out[:,i] ) on one probe batch
+        # 4) Phase A: compute g_vec and v_i_flat list at CURRENT params (NO anchor swap here)
         # -----------------------------
         batch0 = probe_batches_use[0]
         out0, q0, bs0, K0, nmb_crops0, crops_for_assign0 = _forward_logits_and_q_assign(batch=batch0, require_grad=True)
@@ -717,41 +716,53 @@ class CurvatureSkipController:
             crops_for_assign_actual=crops_for_assign0,
         )
 
-        # dloss/dout : [N,K]
         grad_out0 = torch.autograd.grad(loss0, out0, retain_graph=True)[0]
-        # 取你关心的 crop 部分（和 q/assign 一致地取 crop_id_for_diag）
+
         out0_crop = out0[bs0 * crop_id_for_diag: bs0 * (crop_id_for_diag + 1)]
         grad0_crop = grad_out0[bs0 * crop_id_for_diag: bs0 * (crop_id_for_diag + 1)]
 
-        # prototype vector g: [K]
         g_vec = grad0_crop.mean(dim=0).detach().to(device=device, dtype=torch.float32)
 
-        # -----------------------------
-        # 5) for i=0..max_i-1:
-        #    v_i = T e_i  (工程可实现版：J^T e_i = grad(mean(out[:,i])) wrt params_list)
-        #    M_ii = v_i^T H_anchor v_i (again via HVP at anchor)
-        # -----------------------------
         K_eff = int(min(K0, max_i))
-        M_diag = torch.zeros(K_eff, device=device, dtype=torch.float32)
 
-        # 注意：这里的 v_i 用的是当前 params 下的 out0_crop（即 J 在当前点）
-        # 你如果想用 anchor 点的 J，把 out0/out0_crop 的 forward 放到 anchor 参数下做即可（代价更大）
-        prototype_wise_debug = []
+        # ---- compute v_i_flat (T e_i) and store; DO NOT call anchor HVP in this phase ----
+        v_list = [None] * K_eff
         for i in range(K_eff):
-            # scalar = mean(out[:,i])  -> grad wrt params gives J^T e_i
-            scalar = out0_crop[:, i].mean()
-            grads_i = torch.autograd.grad(scalar, params_list, retain_graph=True, create_graph=False, allow_unused=True)
-            v_i = []
-            for g in grads_i:
-                if g is None:
+            scalar_i = out0_crop[:, i].mean()
+            grads_i = torch.autograd.grad(
+                scalar_i, params_list,
+                retain_graph=True, create_graph=False, allow_unused=True
+            )
+            flat_parts = []
+            for gi in grads_i:
+                if gi is None:
                     continue
-                v_i.append(g.reshape(-1))
-            if len(v_i) == 0:
+                flat_parts.append(gi.reshape(-1))
+            if len(flat_parts) == 0:
+                v_list[i] = None
+            else:
+                v_list[i] = torch.cat(flat_parts, dim=0).detach().to(device=device, dtype=torch.float32).contiguous()
+
+        # IMPORTANT: free the current graph before any in-place param swap
+        del loss0, grad_out0, grad0_crop, out0_crop, out0
+
+        # -----------------------------
+        # 5) Phase B: compute denom and M_ii under ANCHOR Hessian (anchor swap allowed here)
+        # -----------------------------
+        denom_rayleigh = _rayleigh_hvp_at_anchor(
+            delta_flat=delta_flat,
+            params_list=params_list,
+            anchor_flat=anchor_flat,
+        )
+
+        M_diag = torch.zeros(K_eff, device=device, dtype=torch.float32)
+        cum_weighted = 0.0
+        debug_prototype_wise = []
+        for i in range(K_eff):
+            v_i_flat = v_list[i]
+            if v_i_flat is None:
                 M_diag[i] = 0.0
                 continue
-            v_i_flat = torch.cat(v_i, dim=0).detach().to(device=device, dtype=torch.float32).contiguous()
-
-            # M_ii = v_i^T H_anchor v_i
             M_ii = _rayleigh_hvp_at_anchor(
                 delta_flat=v_i_flat,
                 params_list=params_list,
@@ -759,41 +770,43 @@ class CurvatureSkipController:
             )
             M_diag[i] = float(M_ii)
             if True:
-                single_ratio = M_diag[i] / (denom_rayleigh + 1e-12)
-
-                # 如果你还乘 g_i^2 权重
-                weighted_i = (g_vec[i].item() ** 2) * M_diag[i]
-                weighted_ratio = weighted_i / (denom_rayleigh + 1e-12)
+                g_i = float(g_vec[i].item())
+                weighted_i = (g_i ** 2) * float(M_ii)
 
                 cum_weighted += weighted_i
-                cum_ratio = cum_weighted / (denom_rayleigh + 1e-12)
+
+                denom_safe = float(denom_rayleigh) + 1e-12
+
+                single_ratio = weighted_i / denom_safe
+                cumulative_ratio = cum_weighted / denom_safe
 
                 print(
-                    f"[M_ii DEBUG] i={i:4d} | "
-                    f"M_ii={M_diag[i]:.4e} | "
+                    f"[Mii DEBUG] "
+                    f"i={i:4d} | "
+                    f"M_ii={float(M_ii):.4e} | "
+                    f"g_i={g_i:.4e} | "
+                    f"M_ii*g_i^2={weighted_i:.4e} | "
                     f"single_ratio={single_ratio:.4e} | "
-                    f"weighted_ratio={weighted_ratio:.4e} | "
-                    f"cumulative_weighted_ratio={cum_ratio:.4e}"
+                    f"cumulative_ratio={cumulative_ratio:.4e}"
                 )
-                prototype_wise_debug.append({
+                debug_prototype_wise.append({
                     "i": i,
-                    "M_ii": M_diag[i].item(),
-                    "g_i": g_vec[i].item(),
-                    "g_i^2 * M_ii": weighted_i,
+                    "M_ii": float(M_ii),
+                    "g_i": g_i,
+                    "weighted_i": weighted_i,
                     "single_ratio": single_ratio,
-                    "weighted_ratio": weighted_ratio,
-                    "cumulative_weighted_ratio": cum_ratio,
+                    "cumulative_ratio": cumulative_ratio,
                 })
 
         # -----------------------------
-        # 6) ratio_diag(m): sum_{i<m} g_i^2 M_ii / sum_i g_i^2 M_ii
+        # 6) ratio_diag (full-diag, not top-m by index)
         # -----------------------------
         g2 = (g_vec[:K_eff] ** 2)
         weighted = g2 * M_diag
-        total = float(weighted.sum().item()) + 1e-12
-        m_use = int(min(m_diag, K_eff))
-        top = float(weighted[:m_use].sum().item())
-        ratio_diag = top / total
+        denom_diag = float(weighted.sum().item())
+
+        ratio_diag = denom_diag / (float(denom_rayleigh) + 1e-12)
+
 
         # pack stats
         return {
@@ -808,7 +821,7 @@ class CurvatureSkipController:
             "K_eff": int(K_eff),
             "m_diag": int(m_use),
             "ratio_diag": float(ratio_diag),
-            "prototype_wise_debug": prototype_wise_debug,
+            "prototype_wise_debug": debug_prototype_wise,
             # debug payload (你要可视化/验证就打开；默认别全存，太大)
             # "debug": {
             #     "g_vec_head": g_vec[: min(10, K_eff)].detach().cpu().tolist(),
