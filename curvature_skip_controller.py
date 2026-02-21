@@ -479,7 +479,251 @@ class CurvatureSkipController:
     #   - cumulative contribution / denom (over printed i)
     #
     # By default it selects top-|g_i| prototypes (most meaningful), size = m_print.
+    def debug_print_strict_Mij_contrib(
+        self,
+        *,
+        model,
+        batch=None,                 # current step batch (same format as training: tensor or list of crops)
+        task: int,
+        epoch: int,
+        step: int,
+        m_print: int = 250,     # how many prototype indices to evaluate/print
+        crop_id: int = 0,       # which crop to use for p,q,g,z
+        use_prev_epoch_anchor: bool = True,  # anchor = prev-epoch Hessian cache (must be epoch == anchor+1)
+        print_every: int = 1,   # print every k rows (i) among the selected set
+        eta: float = 1.0,       # scale factor (can absorb lr); ratios unaffected if consistent
+    ):
+        """Strict debug printer for FULL M_ij (no sorting).
 
+        - Phase A (CURRENT params): compute p,q,g and pullback vectors v_i = T_theta e_i
+          for a RANDOM subset of prototype indices (size m_print) WITHOUT sorting.
+        - Phase B (ANCHOR params): compute one anchor probe loss, then HVPs H v_j for all j,
+          then print M_ij = v_i^T (H v_j) for all (i,j) in the selected subset.
+
+        Intended as a sanity check for off-diagonal signs/magnitudes.
+        """
+        import torch
+
+        if self._tracker is None:
+            return {"ok": False, "reason": "no_tracker"}
+        if batch is None:
+            batch = getattr(self._tracker, "_probe_batches", None)[0]
+        device = self.device if self.device is not None else next(model.parameters()).device
+        t, e, s = int(task), int(epoch), int(step)
+
+        # -----------------------------
+        # helpers (local)
+        # -----------------------------
+        def _normalize_inputs(b):
+            if isinstance(b, (tuple, list)):
+                if len(b) == 2 and torch.is_tensor(b[0]):
+                    x = b[0]
+                else:
+                    x = b
+            else:
+                x = b
+            if torch.is_tensor(x):
+                return [x]
+            return list(x)
+
+        def _freeze_bn_stats(_model):
+            _model.train()
+            for m in _model.modules():
+                if isinstance(m, torch.nn.BatchNorm2d):
+                    m.eval()
+
+        def _split_params(_model):
+            theta, C = [], []
+            for name, p in _model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if "prototypes" in name:
+                    C.append(p)
+                else:
+                    theta.append(p)
+            return {"theta": theta, "C": C}
+
+        def _flatten_params(params):
+            if len(params) == 0:
+                return torch.empty(0, device=device)
+            return torch.cat([p.detach().reshape(-1).to(device=device) for p in params], dim=0)
+
+        def _assign_flat_to_params_(params, flat_vec):
+            offset = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel()
+                    p.copy_(flat_vec[offset:offset + n].view_as(p).to(device=p.device, dtype=p.dtype))
+                    offset += n
+            assert offset == flat_vec.numel()
+
+        # -----------------------------
+        # 0) pick anchor params (theta + C) from tracker cache
+        # -----------------------------
+        if use_prev_epoch_anchor:
+            theta_info = self._tracker.get_prev_epoch_hessian(e, "theta")
+            C_info = self._tracker.get_prev_epoch_hessian(e, "C")
+        else:
+            theta_info = self._tracker.get_prev_task_optimal(t, "theta")
+            C_info = self._tracker.get_prev_task_optimal(t, "C")
+
+        if theta_info is None or C_info is None:
+            return {"ok": False, "reason": "missing_anchor_params_for_theta_or_C"}
+
+        theta_anchor_flat = theta_info["params"].to(device=device, dtype=torch.float32)
+        C_anchor_flat = C_info["params"].to(device=device, dtype=torch.float32)
+
+        # -----------------------------
+        # 1) Phase A @ CURRENT params
+        # -----------------------------
+        split = _split_params(model)
+        theta_params = split["theta"]
+        C_params = split["C"]
+        if len(theta_params) == 0 or len(C_params) == 0:
+            return {"ok": False, "reason": "missing_theta_or_C_params"}
+
+        P = C_params[0]
+        inputs = _normalize_inputs(batch)
+        nmb_crops_actual = len(inputs)
+        if crop_id >= nmb_crops_actual:
+            crop_id = 0
+
+        _freeze_bn_stats(model)
+        emb, out = model(inputs)
+        if isinstance(out, list):
+            out = out[getattr(self._tracker, "prototypes_head_index", 0)]
+        if isinstance(emb, (list, tuple)):
+            z_all = emb
+        else:
+            z_all = [emb]
+
+        bs = inputs[0].shape[0]
+        K = out.shape[1]
+        assert out.shape[0] >= bs * nmb_crops_actual, (
+            f"Logits rows {out.shape[0]} < bs*nmb_crops_actual={bs*nmb_crops_actual}."
+        )
+
+        out_crop = out[bs * crop_id: bs * (crop_id + 1)]
+        z_crop = z_all[crop_id] if crop_id < len(z_all) else z_all[0]
+        if z_crop.dim() == 1:
+            z_crop = z_crop.view(1, -1)
+
+        with torch.no_grad():
+            q_res = self._tracker.sinkhorn_fn(
+                out_crop.detach(),
+                tracker=None,
+                clamp_min=getattr(self._tracker, "clamp_min", 1e-6),
+                epoch=e,
+                total_epoch=getattr(self._tracker, "total_epoch", 1),
+            )
+            q = q_res[0] if isinstance(q_res, (tuple, list)) else q_res
+            q = q[-bs:].contiguous()
+
+        temp = float(getattr(self._tracker, "temperature", 0.1))
+        p = torch.softmax(out_crop / temp, dim=1)
+        g_vec = (p - q).mean(dim=0).detach().to(device=device, dtype=torch.float32)
+
+        if P.dim() != 2:
+            return {"ok": False, "reason": f"unexpected_prototypes_shape_{tuple(P.shape)}"}
+        if P.shape[0] == K:
+            Cmat = P.t().contiguous()
+        elif P.shape[1] == K:
+            Cmat = P.contiguous()
+        else:
+            return {"ok": False, "reason": f"prototypes_not_compatible_with_K_{K}", "P_shape": tuple(P.shape)}
+
+        tau = float(getattr(self._tracker, "temperature", 0.1))
+
+        def _T_theta_apply(vK: torch.Tensor) -> torch.Tensor:
+            vK = vK.to(device=z_crop.device, dtype=z_crop.dtype)
+            Cv = (Cmat @ vK) / float(tau)
+            scalar = (z_crop * Cv.view(1, -1)).sum(dim=1).mean()
+            grads = torch.autograd.grad(
+                scalar, theta_params,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=False,
+            )
+            flat = torch.cat([(-eta) * g.reshape(-1) for g in grads], dim=0)
+            return flat.detach().to(device=device, dtype=torch.float32).contiguous()
+
+        # RANDOM subset (no sorting)
+        m_use = int(min(int(m_print), int(K)))
+        gen = torch.Generator(device=device)
+        gen.manual_seed((t * 1000003 + e * 1009 + s * 9176) % (2**31 - 1))
+        idx_tensor = torch.randperm(K, generator=gen, device=device)[:m_use]
+        idx_list = [int(i.item()) for i in idx_tensor]
+
+        v_list = []
+        gi_list = []
+        for idx in idx_list:
+            e_i = torch.zeros_like(g_vec)
+            e_i[idx] = 1.0
+            v_list.append(_T_theta_apply(e_i))
+            gi_list.append(float(g_vec[idx].item()))
+
+        del emb, out, out_crop, z_all, z_crop, p
+
+        # -----------------------------
+        # 2) Phase B @ ANCHOR params: single graph, many HVPs
+        # -----------------------------
+        backup_theta = _flatten_params(theta_params)
+        backup_C = _flatten_params(C_params)
+        try:
+            _assign_flat_to_params_(theta_params, theta_anchor_flat)
+            _assign_flat_to_params_(C_params, C_anchor_flat)
+
+            loss_anchor, _san = self._tracker._probe_loss_swav(
+                model,
+                probe_batches=None,
+                epoch_for_sinkhorn=e,
+                require_grad=True,
+            )
+            grads = torch.autograd.grad(loss_anchor, theta_params, create_graph=True, retain_graph=True)
+            gflat = torch.cat([g.reshape(-1) for g in grads], dim=0)
+
+            hv_list = []
+            for j, v_j in enumerate(v_list):
+                hv = torch.autograd.grad(gflat @ v_j, theta_params, retain_graph=(j < len(v_list)-1))
+                hvflat = torch.cat([h.reshape(-1) for h in hv]).detach()
+                hv_list.append(hvflat)
+        finally:
+            _assign_flat_to_params_(theta_params, backup_theta)
+            _assign_flat_to_params_(C_params, backup_C)
+
+        # -----------------------------
+        # 3) Print full M_ij
+        # -----------------------------
+        printed_rows = 0
+        M = torch.empty((m_use, m_use), device="cpu", dtype=torch.float64)
+
+        for ii, (idx_i, v_i) in enumerate(zip(idx_list, v_list)):
+            if (ii % max(int(print_every), 1)) == 0:
+                for jj, (idx_j, hv_j) in enumerate(zip(idx_list, hv_list)):
+                    M_ij = float((v_i * hv_j.to(device=v_i.device, dtype=v_i.dtype)).sum().item())
+                    M[ii, jj] = M_ij
+                    if M_ij < 0.0:
+                        print(f"[Mij DEBUG strict] i={idx_i:4d} j={idx_j:4d} | M_ij={M_ij:+.6e} <-- NEGATIVE")
+                    else:
+                        print(f"[Mij DEBUG strict] i={idx_i:4d} j={idx_j:4d} | M_ij={M_ij:+.6e} <-- POSITIVE")
+                printed_rows += 1
+            else:
+                for jj, hv_j in enumerate(hv_list):
+                    M[ii, jj] = float((v_i * hv_j.to(device=v_i.device, dtype=v_i.dtype)).sum().item())
+
+        return {
+            "ok": True,
+            "task": t,
+            "epoch": e,
+            "step": s,
+            "K": int(K),
+            "m_use": int(m_use),
+            "indices": idx_list,
+            "g_selected": gi_list,
+            "M_ij_cpu": M,
+            "printed_rows": int(printed_rows),
+        }
+    
     def debug_print_strict_Mii_contrib(
         self,
         *,

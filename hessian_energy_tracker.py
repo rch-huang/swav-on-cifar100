@@ -120,8 +120,11 @@ def _dump_raw_npz(save_dir: str, prefix: str, eigvals: torch.Tensor, proj: torch
         energy=_to_cpu_np(energy),
     )
 
-
 def _freeze_bn_stats(model) -> None:
+    for m in model.modules():
+        if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+            m.eval()
+def _freeze_bn_stats2(model) -> None:
     """
     Keep model in train() but freeze BN running stats by setting BN modules to eval().
     This is a standard compromise for 2nd-order analysis.
@@ -223,6 +226,7 @@ class HessianEnergyTrackerSwAV:
         lanczos_reorth: bool = True,
         lanczos_seed: int = 0,
     ):
+        self._task_optimal_bn = None
         self.anchor_epochs = set(anchor_epochs)
         self.window1 = int(window1)
         self.window2 = int(window2)
@@ -316,11 +320,139 @@ class HessianEnergyTrackerSwAV:
             # do not return: last epoch may also save task-optimal
 
         # 2) save task-optimal snapshot at last epoch
-        if epoch == self.total_epoch - 1:
+        if epoch == self.total_epoch - 1 and False:
             self._register_task_optimal(epoch, model)
 
         return
+    def _compute_hessian_drift(self, task: int, epoch: int, step: int, model,optimal_bn_state_cpu,):
+        """
+        Compute Hessian drift between:
+            H_old(θ_optimal_old)
+        and
+            H_old(θ_current)
 
+        Results saved under:
+            task_optimal/epoch_x/drift_logs/
+        """
+         
+        if 0 not in self._task_optimal_basis:
+            return  # no previous task optimal
+
+        prev_task = 0
+        
+
+        if True:
+            was_training = model.training
+            model.eval()
+
+            bn_backup = self._capture_bn_state_cpu(model)
+            self._restore_bn_state_(model, optimal_bn_state_cpu)
+
+        save_root = os.path.join(
+            self._task_root(prev_task),
+            "task_optimal",
+            f"epoch_{self._task_optimal_epoch[prev_task]}",
+            "drift_logs",
+        )
+        _ensure_dir(save_root)
+
+        split = _split_named_params(model)
+
+        drift_record = {
+            "task": task,
+            "epoch": epoch,
+            "step": step,
+            "blocks": {}
+        }
+
+        for block in ("theta","C"):
+
+            if block not in self._task_optimal_basis[prev_task]:
+                continue
+
+            ref_info = self._task_optimal_basis[prev_task][block]
+            ref_U = ref_info["eigvecs"]
+            ref_vals = ref_info["eigvals"]
+            top_k = ref_info["top_k"]
+
+            params = split.get(block, [])
+            if len(params) == 0:
+                continue
+
+            # Recompute Hessian eigens at current parameter point
+            if task == 0 :
+                eigvals_cur, eigvecs_cur, _ = self._top_hessian_eigens_lanczos(
+                    model=model,
+                    params=params,
+                    top_k=top_k,
+                    epoch_for_sinkhorn=epoch,
+                    tag=f"drift_t{task}_e{epoch}_s{step}/{block}",
+                    probe_batches=self._probe_batches,#self._probe_batches_previous_task,
+                )
+            elif task == 1:
+                eigvals_cur, eigvecs_cur, _ = self._top_hessian_eigens_lanczos(
+                    model=model,
+                    params=params,
+                    top_k=top_k,
+                    epoch_for_sinkhorn=epoch,
+                    tag=f"drift_t{task}_e{epoch}_s{step}/{block}",
+                    probe_batches=self._probe_batches_previous_task,
+                )
+
+            U_ref = ref_U.to(eigvecs_cur.device)
+            U_cur = eigvecs_cur
+
+            # Principal angles
+            M = U_ref.T @ U_cur
+            svals = torch.linalg.svdvals(M)
+
+            overlap = float((svals ** 2).mean().item())
+            min_sv = float(svals.min().item())
+            mean_sv = float(svals.mean().item())
+
+            # Eigval drift
+            eigval_ratio = float((eigvals_cur.mean() / (ref_vals.mean() + 1e-12)).item())
+
+            # Frobenius difference
+            frob = float(torch.norm(M - torch.eye(M.shape[0], device=M.device)).item())
+
+            drift_record["blocks"][block] = {
+                "overlap": overlap,
+                "min_singular": min_sv,
+                "mean_singular": mean_sv,
+                "eigval_ratio": eigval_ratio,
+                "frobenius_diff": frob,
+                "ref_eigvals": ref_vals.detach().cpu().tolist(),
+                "cur_eigvals": eigvals_cur.detach().cpu().tolist(),
+            }
+
+        save_file = os.path.join(
+            save_root,
+            f"drift_t{task}_e{epoch}_s{step}.json"
+        )
+
+        with open(save_file, "w") as f:
+            json.dump(drift_record, f, indent=2)
+
+
+        if True:
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
+
+    def compute_optimal(self,epoch,model):
+        if True:
+                    required_steps = (8, 9, 10)
+                    if all(ss in self._optimal_avg_buffer for ss in required_steps):
+                        avg: Dict[str, torch.Tensor] = {}
+                        for block in ("theta","C"):
+                            vecs = [self._optimal_avg_buffer[ss].get(block, None) for ss in required_steps]
+                            vecs = [v for v in vecs if v is not None]
+                            if len(vecs) > 0:
+                                avg[block] = torch.stack(vecs, dim=0).mean(dim=0).contiguous()
+
+                        # register using averaged weights only (do not re-read from model)
+                        self._register_task_optimal(epoch=epoch, model=model, avg_weights=avg)
+                        self._optimal_registered_tasks.add(int(0))
     def after_step(self, task: int, epoch: int, step: int, model) -> None:
         """
         Step-level hook.
@@ -336,7 +468,52 @@ class HessianEnergyTrackerSwAV:
         Both deltas are projected onto the anchor Hessian top-eigens and saved.
         """
         self.current_task = int(task)
+        if True:
+            if task == 1 or task == 0:
+                 
+                drift_epochs = [0, 2, 4, 10,15, 20, 48,49,51,52,55,75, 80,118, 119]
+                drift_steps = [3]
 
+                if epoch in drift_epochs and step in drift_steps:
+                    self._compute_hessian_drift(
+                        task=task,
+                        epoch=epoch,
+                        step=step,
+                        model=model,
+                        optimal_bn_state_cpu = self._task_optimal_bn
+                    )
+            if epoch == 117 and step in (8, 9, 10):
+                if not hasattr(self, "_optimal_avg_buffer"):
+                    # step(int) -> {block -> flat_cpu_tensor}
+                    self._optimal_avg_buffer: Dict[int, Dict[str, torch.Tensor]] = {}
+                if not hasattr(self, "_optimal_registered_tasks"):
+                    self._optimal_registered_tasks: set = set()
+
+                split = _split_named_params(model)
+                snap: Dict[str, torch.Tensor] = {}
+                for block in ("theta","C"):
+                    params = split.get(block, [])
+                    if len(params) == 0:
+                        continue
+                    # IMPORTANT: flatten order matches _split_named_params
+                    snap[block] = _flatten_params_cpu(params).detach().cpu().contiguous()
+                self._optimal_avg_buffer[int(step)] = snap
+
+                if step == 10 and (int(task) not in self._optimal_registered_tasks):
+                    required_steps = (8, 9, 10)
+                    bn_snapshot = self._capture_bn_state_cpu(model)
+                    self._task_optimal_bn = bn_snapshot
+                    if all(ss in self._optimal_avg_buffer for ss in required_steps):
+                        avg: Dict[str, torch.Tensor] = {}
+                        for block in ("theta","C"):
+                            vecs = [self._optimal_avg_buffer[ss].get(block, None) for ss in required_steps]
+                            vecs = [v for v in vecs if v is not None]
+                            if len(vecs) > 0:
+                                avg[block] = torch.stack(vecs, dim=0).mean(dim=0).contiguous()
+
+                        # register using averaged weights only (do not re-read from model)
+                        self._register_task_optimal(epoch=epoch, model=model, avg_weights=avg,bn_state_cpu=bn_snapshot)
+                        self._optimal_registered_tasks.add(int(task))
         # fast skip: no anchors registered yet
         if len(self._anchors) == 0:
             return
@@ -525,11 +702,170 @@ class HessianEnergyTrackerSwAV:
                 sanity_accum[k] /= count
 
             return loss_avg, sanity_accum
+    
+
+
+
+    def _capture_bn_state_cpu(self, model):
+        """Capture BatchNorm running stats to CPU (running_mean/var + num_batches_tracked)."""
+        bn_state = {}
+        for name, m in model.named_modules():
+            # covers BatchNorm1d/2d/3d
+            if hasattr(m, "running_mean") and m.running_mean is not None and hasattr(m, "running_var") and m.running_var is not None:
+                bn_state[name] = {
+                    "running_mean": m.running_mean.detach().cpu().clone(),
+                    "running_var": m.running_var.detach().cpu().clone(),
+                }
+                if hasattr(m, "num_batches_tracked") and m.num_batches_tracked is not None:
+                    bn_state[name]["num_batches_tracked"] = m.num_batches_tracked.detach().cpu().clone()
+        return bn_state
+
+    def _restore_bn_state_(self, model, bn_state_cpu):
+        """In-place restore BN running stats from CPU snapshot."""
+        if bn_state_cpu is None:
+            return
+        for name, m in model.named_modules():
+            if name not in bn_state_cpu:
+                continue
+            st = bn_state_cpu[name]
+            if hasattr(m, "running_mean") and m.running_mean is not None:
+                m.running_mean.data.copy_(st["running_mean"].to(device=m.running_mean.device, dtype=m.running_mean.dtype))
+            if hasattr(m, "running_var") and m.running_var is not None:
+                m.running_var.data.copy_(st["running_var"].to(device=m.running_var.device, dtype=m.running_var.dtype))
+            if "num_batches_tracked" in st and hasattr(m, "num_batches_tracked") and m.num_batches_tracked is not None:
+                m.num_batches_tracked.data.copy_(st["num_batches_tracked"].to(device=m.num_batches_tracked.device, dtype=m.num_batches_tracked.dtype))
 
     # =========================================================
     # Task-optimal snapshot (for forgetting projections)
     # =========================================================
-    def _register_task_optimal(self, epoch: int, model) -> None:
+    def _register_task_optimal(self, epoch: int, model, *, avg_weights: Dict[str, torch.Tensor],bn_state_cpu=None) -> None:
+        """
+        Save a flat CPU snapshot of parameters at (task, epoch). This is used as "previous-task optimal"
+        reference when computing forgetting projections under a new task's anchor Hessian.
+
+        USER-REQUESTED: this function is driven ONLY by the averaged weights collected in after_step().
+        We do NOT re-read weights from the model.
+
+        Implementation detail:
+        - We temporarily load avg_weights into model params (theta/C) so that Hessian eigens are
+            computed *at the averaged snapshot* using the same _top_hessian_eigens_lanczos routine.
+        - Then we restore the original model weights.
+        """
+        if self.current_task is None:
+            print("[HessianEnergyTrackerSwAV] WARNING: current_task is None; skip saving task-optimal snapshot.")
+            return
+
+        t = int(self.current_task)
+        split = _split_named_params(model)
+
+        def _assign_flat_to_params(params: List[torch.nn.Parameter], flat: torch.Tensor) -> None:
+            """In-place load a flat vector into params, respecting the flatten order."""
+            if len(params) == 0:
+                return
+            flat = flat.detach().to(device=params[0].device, dtype=params[0].dtype)
+            offset = 0
+            for p in params:
+                n = p.numel()
+                p.data.copy_(flat[offset: offset + n].view_as(p))
+                offset += n
+            if offset != int(flat.numel()):
+                raise RuntimeError(f"[TaskOptimal] Flat size mismatch: used {offset}, flat has {flat.numel()}")
+
+        if avg_weights is None or len(avg_weights) == 0:
+            raise ValueError("avg_weights must be a non-empty dict: {block -> flat_cpu_tensor}")
+
+        # Backup current model params and load averaged snapshot for consistent Hessian computation.
+        restored_state: Dict[str, List[torch.Tensor]] = {"theta": [], "C": []}
+
+        if True:
+            was_training = model.training
+            model.eval()
+
+            # 先备份当前 BN stats（为了算完恢复，不影响训练）
+            bn_backup = self._capture_bn_state_cpu(model)
+
+            # 用 optimal snapshot 替换
+            self._restore_bn_state_(model, bn_state_cpu)
+
+
+        for block in ("theta", "C"):
+            params = split.get(block, [])
+            if len(params) == 0:
+                continue
+            restored_state[block] = [p.detach().cpu().clone() for p in params]
+            if block in avg_weights and avg_weights[block] is not None:
+                with torch.no_grad():
+                    _assign_flat_to_params(params, avg_weights[block].detach().cpu())
+
+        save_dir = os.path.join(self._task_root(t), "task_optimal", f"epoch_{epoch}")
+        _ensure_dir(save_dir)
+
+        self._task_optimal[t] = {}
+        self._task_optimal_epoch[t] = int(epoch)
+
+        for block in ["theta", "C"]:
+            if block not in split:
+                continue
+            params = split[block]
+            if len(params) == 0:
+                continue
+            if block not in avg_weights or avg_weights[block] is None:
+                # allow missing block (e.g., prototypes disabled)
+                continue
+
+            # IMPORTANT: do not re-read from model; use the averaged snapshot we computed in after_step
+            w = avg_weights[block].detach().cpu().contiguous()
+            self._task_optimal[t][block] = w.detach().cpu()
+            np.save(os.path.join(save_dir, f"{block}_params.npy"), _to_cpu_np(w))
+
+            # Also compute and save top-k Hessian eigens at task-optimal (for next-task P^(t) projections)
+            top_k = self.top_k_theta if block == "theta" else self.top_k_C
+            
+            
+            eigvals, eigvecs, lanczos_sanity = self._top_hessian_eigens_lanczos(
+                model=model,
+                params=params,
+                top_k=top_k,
+                epoch_for_sinkhorn=epoch,
+                tag=f"task_optimal_t{t}_e{epoch}/{block}",
+                probe_batches=self._probe_batches,
+            )
+            with open(os.path.join(save_dir, f"{block}_eigvals.json"), "w") as f:
+                json.dump({"eigvals": _to_cpu_np(eigvals).tolist()}, f, indent=2)
+            torch.save(eigvecs.detach().cpu(), os.path.join(save_dir, f"{block}_eigvecs.pt"))
+            torch.save(w.detach().cpu(), os.path.join(save_dir, f"{block}_w.pt"))
+            with open(os.path.join(save_dir, f"{block}_lanczos_sanity.json"), "w") as f:
+                json.dump(lanczos_sanity, f, indent=2)
+
+            # cache in RAM (used by controller during next task)
+            self._task_optimal_basis.setdefault(t, {})
+            self._task_optimal_basis[t][block] = {
+                "params": w.detach().cpu(),
+                "eigvals": eigvals.detach().cpu(),
+                "eigvecs": eigvecs.detach().cpu(),
+                "top_k": top_k,
+                "epoch": int(epoch),
+            }
+
+
+
+        if True:
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
+        # Restore model weights
+        for block in ("theta", "C"):
+            params = split.get(block, [])
+            if len(params) == 0:
+                continue
+            saved = restored_state.get(block, [])
+            if len(saved) != len(params):
+                raise RuntimeError("[TaskOptimal] Restore mismatch")
+            for p, old in zip(params, saved):
+                p.data.copy_(old.to(device=p.device, dtype=p.dtype))
+
+        if self.rank == 0:
+            print(f"[HessianEnergyTrackerSwAV] Saved task-optimal snapshot: task={t}, epoch={epoch} -> {save_dir}")
+    def _register_task_optimal2(self, epoch: int, model) -> None:
         """
         Save a flat CPU snapshot of parameters at (task, epoch). This is used as "previous-task optimal"
         reference when computing forgetting projections under a new task's anchor Hessian.

@@ -77,7 +77,7 @@ parser.add_argument("--workers", default=0, type=int)
  
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
-parser.add_argument("--seed", type=int, default=45)
+parser.add_argument("--seed", type=int, default=48)
 parser.add_argument("--clamp_min", type=float, default=-50.0)
 parser.add_argument("--selected_100classes_out_of_200_for_tinyimagenet", type=str, default=None)
 parser.add_argument("--label_remap_for_tinyimagenet", type=str, default=None)
@@ -740,7 +740,7 @@ def main():
     save_root = os.path.join(f"log_{datestamp}", f"hessian_energy_swav")
     #save_root = os.path.join(save_root, f"hessian_energy_swav_task{task_number}")
     tracker = HessianEnergyTrackerSwAV(
-                anchor_epochs=[0,5,30,60,90,119],#[anchor for anchor in range(args.epochs)],
+                anchor_epochs=[],#[0,5,30,60,90,119],#[anchor for anchor in range(args.epochs)],
                 window1=5,
                 window2=15,
                 top_k_theta=80,       
@@ -759,22 +759,22 @@ def main():
      
     skip_controller = CurvatureSkipController(
         skip_mode="hessian",     # or "random"
-        tau_curr_c=-1,            # -1 disable; >=0 enable
+        tau_curr_c=0.4,            # -1 disable; >=0 enable
         tau_prev_c=-1,            # -1 disable; >=0 enable
-        tau_curr_theta=0.3,            # -1 disable; >=0 enable
+        tau_curr_theta=-1,            # -1 disable; >=0 enable
         tau_prev_theta=-1,            # -1 disable; >=0 enable
-        m_anchor_C=-1,
-        m_anchor_theta=10,
+        m_anchor_C=50,
+        m_anchor_theta=-1,
         m_optimal_C=-1,
         m_optimal_theta=-1,
         topk_C=tracker.top_k_C,  # 你也可以自己设一个固定值，或者直接用 tracker 的那个
         topk_theta=tracker.top_k_theta,  # 你也可以自己设一个固定值，或者直接用 tracker 的那个
-        use_theta=True,
-        use_C=False,
+        use_theta=False,
+        use_C=True,
         replay_skip_log=None,
         device="cuda",
     )
-    #skip_controller = None  # disable for now
+    skip_controller = None  # disable for now
     with open(logfile, 'a') as f:
         f.write(f"Skip controller config: {skip_controller.__dict__ if skip_controller is not None else 'None'}\n") 
         f.write(f'tracker config: {tracker.__dict__}\n')
@@ -848,7 +848,7 @@ def main():
             for i,  inputs  in enumerate(train_loader):
                 print(type(inputs), len(inputs), inputs[0].shape, inputs[1].shape)
                 x1, x2 = inputs
-                inputs_small = (x1[:128].contiguous(), x2[:128].contiguous())
+                inputs_small = (x1[:64].contiguous(), x2[:64].contiguous())
                 print(inputs_small[0].shape, inputs_small[1].shape)
                 probe_batches.append(inputs_small)
                 if i == 0:   
@@ -856,7 +856,7 @@ def main():
             if _task_number > 0:   
                 for i,  inputs  in enumerate(previous_train_loader):
                     x1, x2 = inputs
-                    inputs_small = (x1[:128].contiguous(), x2[:128].contiguous())
+                    inputs_small = (x1[:64].contiguous(), x2[:64].contiguous())
                     probe_batches_previous_task.append(inputs_small)
                     if i == 0:   
                         break
@@ -924,6 +924,7 @@ def main():
                                         sinkhorn_tracker = sinkhorn_tracker,hessian_tracker = tracker, skip_controller=skip_controller)
             training_stats.update(scores)
             tracker.after_epoch(epoch,model,task_number)
+             
             if skip_controller is not None:
                 skip_controller.end_epoch()
             # if epoch == args.epochs - 1:
