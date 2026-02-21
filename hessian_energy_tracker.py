@@ -471,8 +471,8 @@ class HessianEnergyTrackerSwAV:
         if True:
             if task == 1 or task == 0:
                  
-                drift_epochs = [0, 2, 4, 10,15, 20, 48,49,51,52,55,75, 80,118, 119]
-                drift_steps = [3]
+                drift_epochs = [0,1, 2,3, 4,5,6,8, 10,15, 20,30,40,50,60,70, 80,90,100,110,118, 119]
+                drift_steps = [5]
 
                 if epoch in drift_epochs and step in drift_steps:
                     self._compute_hessian_drift(
