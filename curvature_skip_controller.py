@@ -10,6 +10,7 @@
 # - Controller does NOT save anything. Any logging is delegated to tracker.
 # - Supports random baseline: replay skip counts from a previous skip log file.
 # ------------------------------------------------------------
+import math
 
 import json
 import os
@@ -305,13 +306,344 @@ class CurvatureSkipController:
 #         stats["skipped"] = bool(skip_blocks)
 
 #         return skip_blocks, stats
+    @staticmethod
+    def apply_rescale_plan(model, rescale_plan: Dict[str, Any], device: Optional[torch.device] = None) -> None:
+        """
+        Apply rescaling to model parameter grads IN-PLACE.
+        Call AFTER loss.backward() and BEFORE optimizer.step().
+
+        rescale_plan is returned by should_skip(..., use_rescale=1/2).
+
+        mode:
+        1: damp only top-m eig-coordinates (ratio -> tau)
+        2: same as 1, then scale the whole block gradient to preserve ||delta|| (energy-preserving)
+        """
+        if not rescale_plan:
+            return
+
+        if device is None:
+            # best-effort
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = torch.device("cpu")
+
+        split = _split_named_params(model)
+
+        def _gather_flat_grads(params: List[torch.nn.Parameter]) -> Tuple[torch.Tensor, List[Tuple[torch.nn.Parameter, int, int]]]:
+            """
+            Returns:
+            flat: [D]
+            meta: list of (param, start, end) for writing back
+            Skips params with grad None (they won't be modified).
+            """
+            chunks = []
+            meta = []
+            offset = 0
+            for p in params:
+                if p.grad is None:
+                    continue
+                g = p.grad.detach()
+                n = g.numel()
+                chunks.append(g.reshape(-1))
+                meta.append((p, offset, offset + n))
+                offset += n
+            if len(chunks) == 0:
+                return torch.empty(0, device=device), []
+            flat = torch.cat(chunks, dim=0).to(device=device, dtype=torch.float32)
+            return flat, meta
+
+        def _write_back_flat_grads(flat: torch.Tensor, meta: List[Tuple[torch.nn.Parameter, int, int]]) -> None:
+            for (p, a, b) in meta:
+                # keep original dtype
+                newg = flat[a:b].reshape(p.grad.shape).to(dtype=p.grad.dtype, device=p.grad.device)
+                p.grad.copy_(newg)
+
+        for block, plan in rescale_plan.items():
+            if not plan or not plan.get("enabled", False):
+                continue
+
+            params = split.get(block, [])
+            if not params:
+                continue
+
+            delta, meta = _gather_flat_grads(params)
+            if delta.numel() == 0:
+                continue
+
+            norm0 = float(plan.get("delta_norm", float(delta.norm().item())))
+            mode = int(plan.get("mode", 1))
+            steps = plan.get("steps", [])
+
+            # Sequentially apply each triggered constraint (anchor and/or optimal)
+            for st in steps:
+                gamma = float(st["gamma"])
+                if gamma >= 1.0:
+                    continue
+                U_hi = st["U_hi"].to(device=device, dtype=torch.float32)      # [D, m]
+                proj_hi = st["proj_hi"].to(device=device, dtype=torch.float32)  # [m]
+                # delta <- delta + (gamma-1) * U_hi @ proj_hi
+                delta = delta + (gamma - 1.0) * (U_hi @ proj_hi)
+
+            if mode == 2:
+                # energy-preserving: scale entire block gradient to keep ||delta|| unchanged
+                norm1 = float(delta.norm().item())
+                if norm1 > 0:
+                    alpha = norm0 / (norm1 + 1e-12)
+                    delta = alpha * delta
+
+            _write_back_flat_grads(delta, meta)
     def should_skip(
+        self,
+        *,
+        task: int,
+        epoch: int,
+        step: int,
+        model,
+        use_rescale: int = 0,   # 0: original skip; 1: rescale; 2: rescale + energy-preserving (keep ||delta||)
+    ):
+        """
+        Returns:
+        - skip_blocks: set[str] ("theta"/"C")  [only meaningful when use_rescale==0 or skip_mode=="random"]
+        - stats: dict
+        - rescale_plan: dict that contains all info needed to apply rescaling to grads (after this call)
+
+        Rescale semantics:
+        use_rescale=0: identical to old behavior (skip if ratio>=tau).
+        use_rescale=1: never skip by Hessian rules; instead return rescale_plan to damp top-m eig-coordinates until ratio hits tau.
+        use_rescale=2: same as 1, plus scale whole block gradient to preserve ||delta|| (energy-preserving).
+        """
+        assert use_rescale in (0, 1, 2)
+        device = self.device
+        t, e, s = int(task), int(epoch), int(step)
+
+        stats = {
+            "task": t,
+            "epoch": e,
+            "step": s,
+            "skip_mode": self.skip_mode,
+            "reasons": [],
+            "use_rescale": int(use_rescale),
+        }
+
+        skip_blocks = set()
+        rescale_plan: Dict[str, Any] = {}  # per-block plan; empty means "no rescale"
+
+        # ------------------------------------------------------------
+        # Random baseline
+        # ------------------------------------------------------------
+        if self.skip_mode == "random":
+            if s in self._random_skip_steps:
+                skip_blocks = {"theta", "C"}
+                stats["reasons"].append("random")
+            stats["skip_blocks"] = sorted(skip_blocks)
+            stats["skipped"] = bool(skip_blocks)
+            # random mode: no rescale
+            return skip_blocks, stats, rescale_plan
+
+        # ------------------------------------------------------------
+        # Hessian-based skip / rescale
+        # ------------------------------------------------------------
+        if self._tracker is None:
+            stats["skip_blocks"] = []
+            stats["skipped"] = False
+            return set(), stats, rescale_plan
+
+        split = _split_named_params(model)
+
+        # helper: compute a rescale "step" (for anchor or optimal)
+        def _maybe_build_rescale_step(
+            *,
+            U: torch.Tensor,         # [D, k] eigvec basis (already truncated)
+            delta: torch.Tensor,     # [D]
+            m: int,
+            tau: float,
+            basis_name: str,
+            block: str,
+        ) -> Optional[Dict[str, Any]]:
+            # project and compute ratio exactly as your current condition
+            proj = U.T @ delta                       # [k]
+            energy = proj.pow(2)                     # [k]
+            denom = energy.sum() + 1e-12
+            m_eff = min(int(m), int(energy.numel()))
+            if m_eff <= 0:
+                return None
+            num = energy[:m_eff].sum()
+            ratio = float((num / denom).item())
+
+            # record stats for transparency
+            stats[f"{block}/{basis_name}_ratio"] = ratio
+            stats[f"{block}/{basis_name}_tau"] = float(tau)
+            stats[f"{block}/{basis_name}_m"] = int(m)
+
+            if ratio < tau:
+                return None
+
+            # if use_rescale==0, caller will treat this as "trigger skip"
+            if use_rescale == 0:
+                stats["reasons"].append(f"{block}_{basis_name}")
+                return {"trigger_only": True, "ratio": ratio, "tau": float(tau), "m": int(m_eff)}
+
+            # build rescale step info (need U_hi and proj_hi)
+            # We will damp ONLY the first m_eff eig-coordinates:
+            #   proj_hi <- gamma * proj_hi, proj_lo unchanged
+            # gamma chosen s.t. ratio' == tau (under your same denom definition)
+            A = float(energy[:m_eff].sum().item())               # == num
+            B = float((energy.sum() - energy[:m_eff].sum()).item())  # denom - num
+            # Edge cases:
+            # - if B==0 and tau<1, only gamma=0 can reduce ratio from 1 to tau
+            # - if A==0, nothing to do
+            if A <= 0.0:
+                return None
+
+            if tau >= 1.0:
+                # tau>=1 means "always trigger"; but rescale can't satisfy ratio==1 unless gamma==1.
+                # safest: no-op gamma=1
+                gamma = 1.0
+            else:
+                gamma_sq = (tau * max(B, 0.0)) / ((1.0 - tau) * A + 1e-12)
+                # Only damp (gamma<=1). If gamma_sq>1, then ratio already <= tau would have happened,
+                # but due to numeric we clamp anyway.
+                gamma_sq = max(0.0, min(1.0, gamma_sq))
+                gamma = math.sqrt(gamma_sq)
+
+            U_hi = U[:, :m_eff]                 # [D, m_eff]
+            proj_hi = proj[:m_eff].detach()     # [m_eff]
+
+            stats["reasons"].append(f"{block}_{basis_name}_rescale")
+            return {
+                "trigger_only": False,
+                "basis": basis_name,
+                "block": block,
+                "tau": float(tau),
+                "m": int(m_eff),
+                "k": int(U.shape[1]),
+                "ratio_before": float(ratio),
+                "ratio_target": float(tau),
+                "gamma": float(gamma),
+                "U_hi": U_hi.detach(),          # keep on device; needed immediately by training loop
+                "proj_hi": proj_hi,
+            }
+
+        for block in ("theta", "C"):
+            if block == "theta" and not self.use_theta:
+                continue
+            if block == "C" and not self.use_C:
+                continue
+
+            params = split.get(block, [])
+            if len(params) == 0:
+                continue
+
+            if block == "theta":
+                k_big = self.topk_theta
+                m_anchor = self.m_anchor_theta
+                m_optimal = self.m_optimal_theta
+                tau_curr = self.tau_curr_theta
+                tau_prev = self.tau_prev_theta
+            else:
+                k_big = self.topk_C
+                m_anchor = self.m_anchor_C
+                m_optimal = self.m_optimal_C
+                tau_curr = self.tau_curr_c
+                tau_prev = self.tau_prev_c
+
+            # STEP-BASED: use current gradients (your current behavior)
+            grads = []
+            shapes = []
+            for p in params:
+                if p.grad is None:
+                    shapes.append(None)
+                    continue
+                g = p.grad.detach()
+                shapes.append(g.shape)
+                grads.append(g.reshape(-1))
+            if len(grads) == 0:
+                continue
+
+            delta = torch.cat(grads).to(device=device, dtype=torch.float32)
+            delta_norm = float(delta.norm().item())
+            stats[f"{block}/delta_norm"] = delta_norm
+
+            # Collect rescale steps (anchor and/or optimal). If use_rescale==0, they act as triggers.
+            block_triggered = False
+            block_steps: List[Dict[str, Any]] = []
+
+            # =========================================================
+            # Rule A: previous-epoch (anchor) Hessian basis
+            # =========================================================
+            if tau_curr >= 0 and m_anchor > 0:
+                ainfo = self._tracker.get_prev_epoch_hessian(e, block)
+                if ainfo is not None:
+                    U = ainfo["eigvecs"].to(device=device, dtype=torch.float32)
+                    if k_big is not None:
+                        U = U[:, :min(k_big, U.shape[1])]
+                    step_info = _maybe_build_rescale_step(
+                        U=U, delta=delta, m=m_anchor, tau=tau_curr, basis_name="anchor", block=block
+                    )
+                    if step_info is not None:
+                        if step_info.get("trigger_only", False):
+                            block_triggered = True
+                        else:
+                            block_steps.append(step_info)
+
+            # =========================================================
+            # Rule B: previous-task optimal Hessian basis
+            # =========================================================
+            if tau_prev >= 0 and m_optimal > 0:
+                pinfo = self._tracker.get_prev_task_optimal(t, block)
+                if pinfo is not None:
+                    U = pinfo["eigvecs"].to(device=device, dtype=torch.float32)
+                    if k_big is not None:
+                        U = U[:, :min(k_big, U.shape[1])]
+                    step_info = _maybe_build_rescale_step(
+                        U=U, delta=delta, m=m_optimal, tau=tau_prev, basis_name="optimal", block=block
+                    )
+                    if step_info is not None:
+                        if step_info.get("trigger_only", False):
+                            block_triggered = True
+                        else:
+                            block_steps.append(step_info)
+
+            # ---------------------------------------------
+            # Decide: skip (use_rescale==0) or build plan (use_rescale>0)
+            # ---------------------------------------------
+            if use_rescale == 0:
+                if block_triggered:
+                    skip_blocks.add(block)
+                    self._epoch_skip_block_count[block] += 1
+            else:
+                # build plan even if only one of the two steps triggers
+                if len(block_steps) > 0:
+                    rescale_plan[block] = {
+                        "enabled": True,
+                        "mode": int(use_rescale),
+                        "delta_norm": float(delta_norm),
+                        "steps": block_steps,  # sequentially applied in training
+                    }
+                else:
+                    rescale_plan[block] = {"enabled": False, "mode": int(use_rescale), "delta_norm": float(delta_norm), "steps": []}
+
+        # accounting only for real skipping
+        if use_rescale == 0:
+            if skip_blocks:
+                self._epoch_skip_count += 1
+
+        stats["skip_blocks"] = sorted(skip_blocks)
+        stats["skipped"] = bool(skip_blocks)
+        stats["rescale_blocks"] = sorted([b for b, v in rescale_plan.items() if v.get("enabled", False)]) if use_rescale > 0 else []
+        return skip_blocks, stats, rescale_plan
+
+
+
+    def should_skip2(
     self,
     *,
     task: int,
     epoch: int,
     step: int,
     model,
+    use_rescale = False
 ):
         device = self.device
         t, e, s = int(task), int(epoch), int(step)

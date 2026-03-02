@@ -77,7 +77,7 @@ parser.add_argument("--workers", default=0, type=int)
  
 parser.add_argument("--use_fp16", type=bool_flag, default=True)
 parser.add_argument("--dump_path", type=str, default=".")
-parser.add_argument("--seed", type=int, default=46)
+parser.add_argument("--seed", type=int, default=50)
 parser.add_argument("--use_rescale", type=int, default=1)
 
 parser.add_argument("--clamp_min", type=float, default=-50.0)
@@ -530,6 +530,92 @@ def main():
             # full_labels = np.array(train_dataset.dataset['train']['label'])  # shape=(75750,)
             # full_labels = full_labels[full_labels < 100] 
             full_labels = np.array(train_dataset.dataset['label'][train_dataset.indices])
+        
+        if True:
+             
+            def build_baseline2_loaders(
+                *,
+                train_dataset,
+                full_labels,
+                batch_size,
+                workers,
+                seed: int,
+                classes_per_task: int = 10,
+                num_random_task1: int = 100,
+            ):
+                rng = np.random.default_rng(seed)
+
+                all_classes = np.arange(100)
+
+                task0_classes = rng.choice(
+                    all_classes,
+                    size=classes_per_task,
+                    replace=False,
+                )
+
+                remaining_classes = np.setdiff1d(all_classes, task0_classes)
+
+                baseline2_loaders = []
+                baseline2_classlists = []
+
+                # ---- Task0 ----
+                mask0 = np.isin(full_labels, task0_classes)
+                indices0 = np.where(mask0)[0]
+
+                subset0 = TaskSubset(train_dataset, indices0)
+                loader0 = torch.utils.data.DataLoader(
+                    subset0,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=workers,
+                    pin_memory=True,
+                    drop_last=True,
+                )
+
+                baseline2_loaders.append(loader0)
+                baseline2_classlists.append(task0_classes.tolist())
+
+                # ---- 100 random Task1 ----
+                for _ in range(num_random_task1):
+
+                    task1_classes = rng.choice(
+                        remaining_classes,
+                        size=classes_per_task,
+                        replace=False,
+                    )
+
+                    mask1 = np.isin(full_labels, task1_classes)
+                    indices1 = np.where(mask1)[0]
+
+                    subset1 = TaskSubset(train_dataset, indices1)
+                    loader1 = torch.utils.data.DataLoader(
+                        subset1,
+                        batch_size=batch_size,
+                        shuffle=True,
+                        num_workers=workers,
+                        pin_memory=True,
+                        drop_last=True,
+                    )
+                    loader1.classids = task1_classes
+                    baseline2_loaders.append(loader1)
+                    baseline2_classlists.append(task1_classes.tolist())
+
+                return baseline2_loaders, baseline2_classlists
+            
+            baseline2_loaders,baseline2_classlists = build_baseline2_loaders(
+                train_dataset=train_dataset,
+                full_labels=full_labels,
+                batch_size=args.batch_size,
+                workers=args.workers,
+                seed=42,
+            )
+            for loader_idx, loader in enumerate(baseline2_loaders):
+                current_classes = baseline2_classlists[loader_idx]
+                print(f"\n=== Loader {loader_idx} classes: {current_classes} ===")
+
+                 
+ 
+        
         num_tasks = 10
         classes_per_task = 10
 
@@ -746,8 +832,8 @@ def main():
                 anchor_epochs=[],#[anchor for anchor in range(args.epochs)],
                 window1=5,
                 window2=15,
-                top_k_theta=80,       
-                top_k_C=800,         
+                top_k_theta=40,       
+                top_k_C=80,         
                 bin_size=50,
                 save_root=save_root,
                 device="cuda",
@@ -782,17 +868,22 @@ def main():
     with open(logfile, 'a') as f:
         f.write(f"Skip controller config: {skip_controller.__dict__ if skip_controller is not None else 'None'}\n") 
         f.write(f'tracker config: {tracker.__dict__}\n')
-    for _task_number in range(min(2, len(train_loaders))):
+    train_loaders = baseline2_loaders
+    task_class_lists = baseline2_classlists
+    task0_model_state = None
+    task0_bn_state = None
+    task0_mem_batches = []
+
+    for _task_number in range(max(2, len(baseline2_loaders))):
         task_number = _task_number
         
         train_loader = train_loaders[task_number]
         if _task_number > 0:
             #tracker.anchor_epochs = [anchor for anchor in range(args.epochs)]
-            previous_train_loader = train_loaders[task_number-1]
-        prev_eval_loader = train_loaders[task_number-1] if task_number >0 else None   
+            previous_train_loader = train_loaders[0]
+        prev_eval_loader = train_loaders[0] if task_number >0 else None   
         
-        cost_probe_loader =  build_cost_probe_batch(train_loader.dataset, args.batch_size, device="cuda")
-        cost_probe_loaders.append(cost_probe_loader)
+         
         seen_classes.append(task_class_lists[task_number])
         print(f"Starting training on task {task_number} with classes {task_class_lists[task_number]}...")
         with open(logfile, 'a') as f:
@@ -851,13 +942,18 @@ def main():
             probe_batches = []
             probe_batches_previous_task = []
             for i,  inputs  in enumerate(train_loader):
-                print(type(inputs), len(inputs), inputs[0].shape, inputs[1].shape)
-                x1, x2 = inputs
-                inputs_small = (x1[:64].contiguous(), x2[:64].contiguous())
-                print(inputs_small[0].shape, inputs_small[1].shape)
-                probe_batches.append(inputs_small)
-                if i == 0:   
-                    break
+                if i == 0:
+                    print(type(inputs), len(inputs), inputs[0].shape, inputs[1].shape)
+                    x1, x2 = inputs
+                    inputs_small = (x1[:64].contiguous(), x2[:64].contiguous())
+                    print(inputs_small[0].shape, inputs_small[1].shape)
+                    probe_batches.append(inputs_small)
+                if  _task_number == 0:   
+                    print(type(inputs), len(inputs), inputs[0].shape, inputs[1].shape)
+                    x1, x2 = inputs
+                    inputs_small = (x1[:256].contiguous(), x2[:256].contiguous())
+                    print(inputs_small[0].shape, inputs_small[1].shape)
+                    task0_mem_batches.append(inputs_small)
             if _task_number > 0:   
                 for i,  inputs  in enumerate(previous_train_loader):
                     x1, x2 = inputs
@@ -870,8 +966,15 @@ def main():
             tracker.start_task(model, probe_batches, probe_batches_previous_task, epoch0=0,task=task_number)
             if skip_controller is not None:
                 skip_controller.start_task(task=task_number, tracker=tracker)
-        for epoch in range(0, args.epochs):
+        if task_number>0:
+            restore_task0_state(model, task0_model_state, task0_bn_state)
              
+        for epoch in range(0, args.epochs):
+            
+            if task_number >0:
+                if epoch ==5:
+                    break
+
             proto_hash_ref = tensor_hash(model.prototypes.weight.detach())
             if prev_eval_loader is not None:
                 prev_loss = eval_swav_loss_on_loader(model, prev_eval_loader, args, device="cuda", max_batches=20, epoch=epoch)
@@ -880,11 +983,6 @@ def main():
                 logger.info(f"[PrevTaskLoss] BEFORE task={task_number} epoch={epoch} prev_task=0 swav_loss={prev_loss:.6f}")
 
             if epoch in get_knneval_epoch_from_switch(datestamp) or 0 in get_knneval_epoch_from_switch(datestamp):
-                for cost_probe_loader_idx in range(len(cost_probe_loaders)):
-                    _cost_probe_loader = cost_probe_loaders[cost_probe_loader_idx]
-                    
-                    result = plot_cost_matrix(_cost_probe_loader[0],model,args,path=f"log_{datestamp}/cost_heatmap/cost_data{cost_probe_loader_idx}_onTask{task_number}_epoch{epoch}.png", task=task_number, epoch=epoch, data_index=cost_probe_loader_idx)
-                    print(f"Epoch {epoch} Cost matrix plot for data from task {cost_probe_loader_idx} on model of task {task_number} saved to log_{datestamp}/cost_heatmap/cost_data{cost_probe_loader_idx}_onTask{task_number}_epoch{epoch}.png    ")
                      
 
                      
@@ -914,7 +1012,8 @@ def main():
                 ).cuda()
             if skip_controller is not None:
                 skip_controller.start_epoch(task=task_number, epoch=epoch, total_steps=len(train_loader),tracker=tracker)
-
+             
+            
             # train the network
             scores, queue = train(train_loader, 
                                         model,
@@ -926,7 +1025,9 @@ def main():
                                         lr_schedule,
                                         queue,
                                         logfile=logfile,
-                                        sinkhorn_tracker = sinkhorn_tracker,hessian_tracker = tracker, skip_controller=skip_controller)
+                                        sinkhorn_tracker = sinkhorn_tracker,hessian_tracker = tracker, skip_controller=skip_controller,
+                                        classids = baseline2_classlists[task_number],
+                                        task0_mem_batches=task0_mem_batches)
             training_stats.update(scores)
             tracker.after_epoch(epoch,model,task_number)
              
@@ -936,7 +1037,24 @@ def main():
             #      tracker.end_task()
 
             if epoch == args.epochs - 1:
-                 
+                if task_number == 0:
+                    print("Saving Task0 optimal state...")
+
+                    task0_model_state = {
+                        k: v.detach().cpu().clone()
+                        for k, v in model.state_dict().items()
+                    } 
+                    # 保存 BN running stats（如果有 BN）
+                    task0_bn_state = {}
+                    for name, module in model.named_modules():
+                        if isinstance(module, torch.nn.BatchNorm2d):
+                            task0_bn_state[name] = {
+                                "running_mean": module.running_mean.detach().cpu().clone(),
+                                "running_var": module.running_var.detach().cpu().clone(),
+                                "num_batches_tracked": module.num_batches_tracked.detach().cpu().clone(),
+                            }
+
+                    print("Task0 checkpoint stored in memory.")
                 prev_loss = eval_swav_loss_on_loader(model, train_loader, args, device="cuda", max_batches=20, epoch=epoch)
                 with open(logfile, 'a') as f:
                     f.write(f"[PrevTaskLoss] AFTER task={task_number} epoch={epoch} prev_task=0 swav_loss={prev_loss:.6f}\n")
@@ -989,12 +1107,26 @@ def main():
             proto_hash_now = tensor_hash(model.prototypes.weight.detach())
             logger.info(f"[Proto Hash] {proto_hash_ref} -> {proto_hash_now}")
 
-             
+def restore_task0_state(model, task0_model_state, task0_bn_state):
+    # 恢复 weights
+    model.load_state_dict(task0_model_state, strict=True)
+
+    # 恢复 BN
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            if name in task0_bn_state:
+                module.running_mean.data.copy_(task0_bn_state[name]["running_mean"])
+                module.running_var.data.copy_(task0_bn_state[name]["running_var"])
+                module.num_batches_tracked.data.copy_(
+                    task0_bn_state[name]["num_batches_tracked"]
+                )             
 def tensor_hash(x):
     return hashlib.md5(x.cpu().numpy().tobytes()).hexdigest()
 from torch.amp import autocast, GradScaler
 q_assign_test = {}
-def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, queue,logfile='train_log.txt',sinkhorn_tracker=None,hessian_tracker = None, skip_controller=None):
+import random
+def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, queue,logfile='train_log.txt',sinkhorn_tracker=None,hessian_tracker = None, skip_controller=None,classids=[],task0_mem_batches=None):
+     
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -1007,7 +1139,26 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
     
     for it, inputs in enumerate(train_loader):
         data_time.update(time.time() - end)
+        if task0_mem_batches != None and task>0:
+            view1, view2 = inputs
+             
+            bs_new = view1.size(0)           
+     
+            mem_view1, mem_view2 = task0_mem_batches[it]
+            num_replace = 128
+            mem_bs = mem_view1.size(0)
 
+            idx_mem = torch.randperm(mem_bs)[:num_replace]
+
+            mem_samples_v1 = mem_view1[idx_mem]
+            mem_samples_v2 = mem_view2[idx_mem]
+
+            view1 = torch.cat([view1, mem_samples_v1], dim=0)
+            view2 = torch.cat([view2, mem_samples_v2], dim=0)
+            inputs = [view1, view2] 
+        else:
+            bs_new = None
+            num_replace = 0
         # update learning rate
         iteration = epoch * len(train_loader) + it
         for param_group in optimizer.param_groups:   
@@ -1087,12 +1238,44 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
                         if sinkhorn_tracker != None:
                             sinkhorn_tracker.reset()
 
-                        q,q_joint = distributed_sinkhorn(out,
-                        tracker=sinkhorn_tracker,
-                        clamp_min=args.clamp_min,
-                        epoch = epoch,
-                        total_epoch = args.epochs)[-bs:]
-                        q_assign_test[crop_id] = q
+                        if (bs_new is not None) and (num_replace > 0):
+                            # ---- 1) 只用 new 部分做 Sinkhorn ----
+                            out_new = out[:bs_new].contiguous()
+                            q_new, q_joint_new = distributed_sinkhorn(
+                                out_new,
+                                tracker=sinkhorn_tracker,
+                                clamp_min=args.clamp_min,
+                                epoch=epoch,
+                                total_epoch=args.epochs,
+                            )
+
+                            # ---- 2) replay 部分不进 Sinkhorn：用当前 logits 的 softmax（detach） ----
+                            with torch.no_grad():
+                                out_mem = out[bs_new:].contiguous()
+                                q_mem = torch.softmax(out_mem.float() / args.temperature, dim=1)  # B_mem x K, fp32更稳
+                                q_mem = q_mem.to(out.dtype)
+
+                            # ---- 3) 拼回一个完整 batch 的 q，供后面 loss 用 ----
+                            q = torch.cat([q_new, q_mem], dim=0)
+
+                            # q_joint 只用于你日志指标；建议也只用 OT-new 的（不让 replay 污染 joint 统计）
+                            q_joint = q_joint_new
+
+                            # ---- 4) prototype usage 统计也只记录 new 的 q（避免 replay 污染 usage bins）----
+                            with torch.no_grad():
+                                all_Q_epoch.append(q_new.detach().cpu())
+
+                        else:
+                            # 没有 replay：保持原逻辑
+                            q, q_joint = distributed_sinkhorn(
+                                out,
+                                tracker=sinkhorn_tracker,
+                                clamp_min=args.clamp_min,
+                                epoch=epoch,
+                                total_epoch=args.epochs,
+                            )
+                            with torch.no_grad():
+                                all_Q_epoch.append(q.detach().cpu())
                          
 
 
@@ -1314,7 +1497,7 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
             scaler.update()
 
             # ---- after_step should be AFTER optimizer.step ----
-            hessian_tracker.after_step(task, epoch, it, model)
+            hessian_tracker.after_step(task, epoch, it, model,classids=classids)
 
 
         else:

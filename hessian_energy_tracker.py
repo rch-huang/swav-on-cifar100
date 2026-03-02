@@ -262,6 +262,9 @@ class HessianEnergyTrackerSwAV:
         self._sanity_log: Dict[int, List[Dict[str, float]]] = {}
         self._epoch0 = 0
         self.plot_every = 1
+        # in __init__
+        self._beta_anchor = None  # dict or None
+        self._beta_steps_per_epoch = 19  # default; if yours is different, overwrite externally once
         _ensure_dir(self.save_root)
 
     # -------------------------
@@ -313,16 +316,19 @@ class HessianEnergyTrackerSwAV:
         """
         if task is not None:
             self.current_task = int(task)
-
+        
+        
         # 1) anchor registration at this epoch
-        if epoch in self.anchor_epochs:
-            self._register_anchor(epoch, model)
+        if True:
+            if epoch in self.anchor_epochs:
+                self._register_anchor(epoch, model)
             # do not return: last epoch may also save task-optimal
 
         # 2) save task-optimal snapshot at last epoch
         if epoch == self.total_epoch - 1 and False:
             self._register_task_optimal(epoch, model)
 
+        
         return
     def _compute_hessian_drift(self, task: int, epoch: int, step: int, model,optimal_bn_state_cpu,):
         """
@@ -389,7 +395,7 @@ class HessianEnergyTrackerSwAV:
                     tag=f"drift_t{task}_e{epoch}_s{step}/{block}",
                     probe_batches=self._probe_batches,#self._probe_batches_previous_task,
                 )
-            elif task == 1:
+            elif task > 0:
                 eigvals_cur, eigvecs_cur, _ = self._top_hessian_eigens_lanczos(
                     model=model,
                     params=params,
@@ -453,7 +459,245 @@ class HessianEnergyTrackerSwAV:
                         # register using averaged weights only (do not re-read from model)
                         self._register_task_optimal(epoch=epoch, model=model, avg_weights=avg)
                         self._optimal_registered_tasks.add(int(0))
-    def after_step(self, task: int, epoch: int, step: int, model) -> None:
+     
+    def beta_anchor_and_beta_hook(self, task: int, epoch: int, step: int, model) -> None:
+        """
+        A2-beta experiment hook.
+        Called from after_step(task, epoch, step, model).
+
+        - Task0/Task1 (epoch>=5): record a *simple* anchor at end of epochs divisible by 5
+        (anchor = flat weights only; no Lanczos; overwrite old anchor).
+        - For each anchor, compute beta at:
+            +5 step, +15 step, +2 epoch end, +3 epoch end
+        using CURRENT task probe batches.
+        - Special case: Task1 epoch0 (early transition):
+            do NOT record anchors.
+            Instead compute beta at:
+            (e0,s5), (e0,s15), (e2,end), (e3,end)
+            using OLD-task optimal as anchor + OLD BN + previous_task probe batches.
+        - Memory: keep only latest anchor; no basis caching.
+        """
+
+        # -----------------------
+        # local helpers
+        # -----------------------
+        steps_per_epoch = int(getattr(self, "_beta_steps_per_epoch", 19))
+        last_step = steps_per_epoch - 1
+
+        def _flatten_now():
+            split = _split_named_params(model)
+            theta_params = split["theta"]
+            C_params = split["C"]
+            w_theta = _flatten_params_cpu(theta_params).detach().cpu().contiguous()
+            w_C = _flatten_params_cpu(C_params).detach().cpu().contiguous()
+            return theta_params, C_params, w_theta, w_C
+
+        def _compute_beta_from_probe(
+            *,
+            theta_params,
+            C_params,
+            delta_theta: torch.Tensor,
+            delta_C: torch.Tensor,
+            probe_batches,
+            epoch_for_sinkhorn: int,
+            bn_state_cpu=None,
+            tag: str,
+        ):
+            # eval + optional BN restore (must restore afterwards)
+            was_training = model.training
+            bn_backup = self._capture_bn_state_cpu(model)
+            model.eval()
+            if bn_state_cpu is not None:
+                self._restore_bn_state_(model, bn_state_cpu)
+
+            # build loss graph on specified probe batches
+            loss, _ = self._probe_loss_swav(
+                model,
+                probe_batches=probe_batches,
+                epoch_for_sinkhorn=int(epoch_for_sinkhorn),
+                require_grad=True,
+            )
+
+            grads = torch.autograd.grad(
+                loss,
+                theta_params + C_params,
+                create_graph=True,
+                retain_graph=True,
+            )
+            g_theta = torch.cat([g.reshape(-1) for g in grads[:len(theta_params)]])
+            g_C = torch.cat([g.reshape(-1) for g in grads[len(theta_params):]])
+
+            # θθ energy
+            hv_theta = torch.autograd.grad(g_theta @ delta_theta, theta_params, retain_graph=True)
+            hv_theta_flat = torch.cat([h.reshape(-1) for h in hv_theta])
+            E_theta = float((delta_theta * hv_theta_flat).sum().item())
+
+            # CC energy
+            hv_C = torch.autograd.grad(g_C @ delta_C, C_params, retain_graph=True)
+            hv_C_flat = torch.cat([h.reshape(-1) for h in hv_C])
+            E_C = float((delta_C * hv_C_flat).sum().item())
+
+            # cross (θC)
+            hv_cross = torch.autograd.grad(g_theta @ delta_theta, C_params, retain_graph=False)
+            hv_cross_flat = torch.cat([h.reshape(-1) for h in hv_cross])
+            E_cross = float((delta_C * hv_cross_flat).sum().item())
+
+            # beta: you want 4 betas per anchor (intervals). Here use your energy-style ratio.
+            # beta = abs(E_cross) / (abs(E_theta) + abs(E_C) + 1e-12)
+            denom = (abs(E_theta) * abs(E_C)) ** 0.5 + 1e-12
+            beta = abs(E_cross) / denom
+
+            # restore BN + train/eval state
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
+
+            # log (jsonl)
+            save_dir = os.path.join(self._task_root(task), "beta_a2_experiment")
+            _ensure_dir(save_dir)
+            path = os.path.join(save_dir, "beta_a2.jsonl")
+            rec = {
+                "task": int(task),
+                "epoch": int(epoch),
+                "step": int(step),
+                "tag": str(tag),
+                "E_theta": float(E_theta),
+                "E_C": float(E_C),
+                "E_cross": float(E_cross),
+                "E_cross2": float(2.0 * E_cross),
+                "beta": float(beta),
+            }
+            with open(path, "a") as f:
+                import json
+                f.write(json.dumps(rec) + "\n")
+
+            # cleanup
+            del grads, g_theta, g_C, hv_theta, hv_C, hv_cross, hv_theta_flat, hv_C_flat, hv_cross_flat, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # ============================================================
+        # Special transition logic: Task1 epoch0 uses T0 optimal anchor
+        # ============================================================
+        if task == 1 and epoch < 5:
+            prev_task = 0  # you are doing 2-task case; if generalized, use task-1
+            if prev_task not in self._task_optimal:
+                raise RuntimeError("[A2] Missing previous-task optimal weights in self._task_optimal.")
+            if self._task_optimal_bn is None:
+                raise RuntimeError("[A2] Missing previous-task optimal BN snapshot self._task_optimal_bn.")
+            if self._probe_batches_previous_task is None:
+                raise RuntimeError("[A2] Missing self._probe_batches_previous_task (pass it in start_task).")
+
+            # trigger points: (e0,s5),(e0,s15),(e2,end),(e3,end)
+            need = False
+            tag = None
+            if epoch == 0 and step in (5, 15):
+                need = True
+                tag = f"t1_transition+{step}step"
+            if epoch in (2, 3) and step == last_step:
+                need = True
+                tag = f"t1_transition+{epoch}epoch_end"
+
+            if not need:
+                return
+
+            theta_params, C_params, w_theta_now, w_C_now = _flatten_now()
+            w_theta_star = self._task_optimal[prev_task]["theta"].detach().cpu()
+            w_C_star = self._task_optimal[prev_task]["C"].detach().cpu()
+
+            delta_theta = (w_theta_now.to(self.device) - w_theta_star.to(self.device)).detach()
+            delta_C = (w_C_now.to(self.device) - w_C_star.to(self.device)).detach()
+
+            # IMPORTANT: H evaluated with old BN + previous-task probe
+            _compute_beta_from_probe(
+                theta_params=theta_params,
+                C_params=C_params,
+                delta_theta=delta_theta,
+                delta_C=delta_C,
+                probe_batches=self._probe_batches_previous_task,
+                epoch_for_sinkhorn=self._task_optimal_epoch[prev_task],
+                bn_state_cpu=self._task_optimal_bn,
+                tag=tag,
+            )
+            return
+
+        # ============================================================
+        # Normal within-task logic (Task0 always; Task1 from epoch>=5)
+        # ============================================================
+
+        # (A) record simple anchor at end of epochs divisible by 5
+        if (epoch % 5 == 0) and (step == last_step):
+            # Note: For Task1 E0 end you said do NOT record; already excluded by (task==1 and epoch<5) return above.
+            theta_params, C_params, w_theta_now, w_C_now = _flatten_now()
+            self._beta_anchor = {
+                "task": int(task),
+                "epoch": int(epoch),
+                "step": int(step),
+                "theta": w_theta_now,  # CPU flat
+                "C": w_C_now,          # CPU flat
+            }
+            return  # recording-only step
+
+        # no anchor => nothing to do
+        if self._beta_anchor is None:
+            return
+
+        # only use the latest anchor; if anchor belongs to a different task, drop it
+        if int(self._beta_anchor["task"]) != int(task):
+            self._beta_anchor = None
+            return
+
+        a_epoch = int(self._beta_anchor["epoch"])
+        a_step = int(self._beta_anchor["step"])  # should be last_step
+
+        # compute offset in steps since anchor
+        offset_steps = (epoch - a_epoch) * steps_per_epoch + (step - a_step)
+
+        # trigger points relative to anchor:
+        # +5 step, +15 step, +2 epoch end, +3 epoch end
+        need = False
+        tag = None
+        if offset_steps == 5:
+            need = True
+            tag = "within+5step"
+        elif offset_steps == 15:
+            need = True
+            tag = "within+15step"
+        elif (epoch == a_epoch + 2) and (step == last_step):
+            need = True
+            tag = "within+2epoch_end"
+        elif (epoch == a_epoch + 3) and (step == last_step):
+            need = True
+            tag = "within+3epoch_end"
+
+        if not need:
+            return
+
+        # compute delta to simple anchor
+        theta_params, C_params, w_theta_now, w_C_now = _flatten_now()
+        w_theta_a = self._beta_anchor["theta"]
+        w_C_a = self._beta_anchor["C"]
+
+        delta_theta = (w_theta_now.to(self.device) - w_theta_a.to(self.device)).detach()
+        delta_C = (w_C_now.to(self.device) - w_C_a.to(self.device)).detach()
+
+        # IMPORTANT: within-task uses CURRENT task probe batches; BN just backed up/restored (no special swapping)
+        _compute_beta_from_probe(
+            theta_params=theta_params,
+            C_params=C_params,
+            delta_theta=delta_theta,
+            delta_C=delta_C,
+            probe_batches=self._probe_batches,
+            epoch_for_sinkhorn=epoch,
+            bn_state_cpu=None,
+            tag=tag,
+        )
+
+        # once we've passed the farthest interval (+3epoch_end), clear anchor to avoid holding memory
+        if (epoch > a_epoch + 3) or ((epoch == a_epoch + 3) and (step == last_step)):
+            # keep it simple: clear after we hit +3epoch_end
+            if tag == "within+3epoch_end":
+                self._beta_anchor = None
+    def after_step(self, task: int, epoch: int, step: int, model,classids=[]) -> None:
         """
         Step-level hook.
 
@@ -467,11 +711,22 @@ class HessianEnergyTrackerSwAV:
 
         Both deltas are projected onto the anchor Hessian top-eigens and saved.
         """
+        #self.beta_anchor_and_beta_hook(task, epoch, step, model)
+        if True:
+            if task > 0 and epoch in [0,1,2,3,4] and step in [5,10,15]:
+                self.log_high_curvature_trace(
+                    task=task,
+                    epoch=epoch,
+                    step=step,
+                    model=model,
+                    classids=classids,  
+                )
+                #return
         self.current_task = int(task)
         if True:
-            if task == 1 or task == 0:
-                 
-                drift_epochs = [0,1, 2,3, 4,5,6,8, 10,15, 20,30,40,50,60,70, 80,90,100,110,118, 119]
+            #if task == 1 or task == 0:
+            if task > 0 and task < 3:     
+                drift_epochs = [0,1, 2,3, 4,5,6,7,8, 10,15, 20,30,40,50,60,70, 80,90,100,110,118, 119]
                 drift_steps = [5]
 
                 if epoch in drift_epochs and step in drift_steps:
@@ -482,7 +737,7 @@ class HessianEnergyTrackerSwAV:
                         model=model,
                         optimal_bn_state_cpu = self._task_optimal_bn
                     )
-            if epoch == 117 and step in (8, 9, 10):
+            if epoch == 119 and step in (8, 9, 10):
                 if not hasattr(self, "_optimal_avg_buffer"):
                     # step(int) -> {block -> flat_cpu_tensor}
                     self._optimal_avg_buffer: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -925,6 +1180,173 @@ class HessianEnergyTrackerSwAV:
 
         if self.rank == 0:
             print(f"[HessianEnergyTrackerSwAV] Saved task-optimal snapshot: task={t}, epoch={epoch} -> {save_dir}")
+    
+    
+    def log_high_curvature_trace(
+        self,
+        *,
+        task: int,
+        epoch: int,
+        step: int,
+        model,
+        classids,
+        trial_id: int | None = None,
+        seed: int | None = None,
+    ):
+         
+
+         
+        if not (task > 0 and epoch in (0, 1, 2, 3, 4) and step in (5, 10, 15)):
+            return
+
+        if 0 not in self._task_optimal_basis:
+            raise RuntimeError("Task0 optimal basis missing.")
+        if 0 not in self._task_optimal:
+            raise RuntimeError("Task0 optimal weights missing.")
+        if self._probe_batches_previous_task is None:
+            raise RuntimeError("Old-task probe batches missing.")
+        if self._task_optimal_bn is None:
+            raise RuntimeError("Old BN snapshot missing.")
+
+        device = self.device
+
+        # ---------------- Load basis (CPU) ----------------
+        basis = self._task_optimal_basis[0]["theta"]
+        U_cpu = basis["eigvecs"]        # [D, K_big]
+        eigvals_cpu = basis["eigvals"]  # [K_big]
+        K_big = int(basis["top_k"])
+
+        # ---------------- Build Δθ ----------------
+        split = _split_named_params(model)
+        theta_params = split["theta"]
+        if len(theta_params) == 0:
+            return
+
+        w_now_cpu = _flatten_params_cpu(theta_params).float()
+        w_star_cpu = self._task_optimal[0]["theta"].float().cpu()
+        delta_cpu = (w_now_cpu - w_star_cpu).contiguous()
+
+        # ---------------- Per-eigen traces ----------------
+        proj_cpu = (U_cpu.T @ delta_cpu)
+        proj2_cpu = proj_cpu.pow(2)
+        weighted_cpu = eigvals_cpu * proj2_cpu
+        band_energy = float(weighted_cpu.sum().item())
+
+        # ---------------- Helper: assign flat params ----------------
+        def _assign_flat(params_list, flat_cpu):
+            if len(params_list) == 0:
+                return
+            flat = flat_cpu.to(device=params_list[0].device, dtype=params_list[0].dtype)
+            offset = 0
+            for p in params_list:
+                n = p.numel()
+                p.data.copy_(flat[offset:offset + n].view_as(p))
+                offset += n
+
+        # ---------------- Backup current params ----------------
+        split_now = _split_named_params(model)
+        theta_now = split_now["theta"]
+        C_now = split_now["C"]
+
+        theta_backup = [p.detach().cpu().clone() for p in theta_now]
+        C_backup = [p.detach().cpu().clone() for p in C_now]
+
+        bn_backup = self._capture_bn_state_cpu(model)
+        was_training = model.training
+
+        # ---------------- Swap to w0* ----------------
+        try:
+            _assign_flat(theta_now, self._task_optimal[0]["theta"])
+            if "C" in self._task_optimal[0]:
+                _assign_flat(C_now, self._task_optimal[0]["C"])
+
+            model.eval()
+            self._restore_bn_state_(model, self._task_optimal_bn)
+
+            # ----- Compute reference old loss (cached) -----
+            if not hasattr(self, "_old_loss_ref_cache") or self._old_loss_ref_cache is None:
+                loss_ref, _ = self._probe_loss_swav(
+                    model,
+                    probe_batches=self._probe_batches_previous_task,
+                    epoch_for_sinkhorn=self._task_optimal_epoch[0],
+                    require_grad=False,
+                )
+                self._old_loss_ref_cache = float(loss_ref.detach().cpu().item())
+
+            L_old_ref = float(self._old_loss_ref_cache)
+
+            # ----- Compute Rayleigh at w0* -----
+            loss_ref_graph, _ = self._probe_loss_swav(
+                model,
+                probe_batches=self._probe_batches_previous_task,
+                epoch_for_sinkhorn=self._task_optimal_epoch[0],
+                require_grad=True,
+            )
+
+            grads = torch.autograd.grad(loss_ref_graph, theta_now, create_graph=True)
+            gflat = torch.cat([g.reshape(-1) for g in grads])
+
+            delta_gpu = delta_cpu.to(device=device, dtype=gflat.dtype)
+            hv = torch.autograd.grad(gflat @ delta_gpu, theta_now)
+            hvflat = torch.cat([h.reshape(-1) for h in hv]).detach()
+
+            rayleigh_ref = float((delta_gpu * hvflat).sum().item())
+            coverage_ref = float(band_energy / (rayleigh_ref + 1e-12))
+
+        finally:
+            # Restore original params + BN
+            with torch.no_grad():
+                for p, old in zip(theta_now, theta_backup):
+                    p.data.copy_(old.to(device=p.device, dtype=p.dtype))
+                for p, old in zip(C_now, C_backup):
+                    p.data.copy_(old.to(device=p.device, dtype=p.dtype))
+
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
+
+            del theta_backup, C_backup
+
+        # ---------------- Compute current old loss ----------------
+        loss_now, _ = self._probe_loss_swav(
+            model,
+            probe_batches=self._probe_batches_previous_task,
+            epoch_for_sinkhorn=self._task_optimal_epoch[0],
+            require_grad=False,
+        )
+
+        L_old_now = float(loss_now.detach().cpu().item())
+        F_old = float(L_old_now - L_old_ref)
+
+        # ---------------- Save JSON ----------------
+        save_dir = os.path.join(self.save_root, "cross_task_statistics")
+        _ensure_dir(save_dir)
+        path = os.path.join(save_dir, "high_curvature_trace.jsonl")
+
+        record = {
+            "seed": None if seed is None else int(seed),
+            "trial_id": None if trial_id is None else int(trial_id),
+            "classids": list(classids),
+
+            "task": int(task),
+            "epoch": int(epoch),
+            "step": int(step),
+
+            "K_big": int(K_big),
+
+            "L_old_ref": L_old_ref,
+            "L_old_now": L_old_now,
+            "F_old": F_old,
+
+            "rayleigh_ref": rayleigh_ref,
+            "band_energy": band_energy,
+            "coverage_ref": coverage_ref,
+
+            "proj2": proj2_cpu.tolist(),
+            "weighted": weighted_cpu.tolist(),
+        }
+
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
     def _process_step_delta(self, *, task: int, epoch: int, step: int, anchor_epoch: int, model, window_suffix:str) -> None:
         """
         Minimal step-level logging for stacked top-K_big eig-projection heatmaps.
