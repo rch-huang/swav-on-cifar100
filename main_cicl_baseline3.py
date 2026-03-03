@@ -59,7 +59,7 @@ parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=False)
 #### optim parameters ###
 #########################
 parser.add_argument("--dataset", default="cifar100", type=str, choices=["cifar100","tinyimagenet","food101"])    
-parser.add_argument("--epochs", default=120, type=int)
+parser.add_argument("--epochs", default=100, type=int)
 parser.add_argument("--batch_size", default=256, type=int)
 parser.add_argument("--base_lr", default=0.05, type=float)
 parser.add_argument("--final_lr", type=float, default=0)
@@ -1027,7 +1027,8 @@ def main():
                                         logfile=logfile,
                                         sinkhorn_tracker = sinkhorn_tracker,hessian_tracker = tracker, skip_controller=skip_controller,
                                         classids = baseline2_classlists[task_number],
-                                        task0_mem_batches=task0_mem_batches)
+                                        task0_mem_batches=task0_mem_batches,
+                                        )
             training_stats.update(scores)
             tracker.after_epoch(epoch,model,task_number)
              
@@ -1144,8 +1145,8 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
              
             bs_new = view1.size(0)           
      
-            mem_view1, mem_view2 = task0_mem_batches[it]
-            num_replace = 128
+            mem_view1, mem_view2 = random.choice(task0_mem_batches)
+            num_replace = 32
             mem_bs = mem_view1.size(0)
 
             idx_mem = torch.randperm(mem_bs)[:num_replace]
@@ -1251,9 +1252,11 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
 
                             # ---- 2) replay 部分不进 Sinkhorn：用当前 logits 的 softmax（detach） ----
                             with torch.no_grad():
-                                out_mem = out[bs_new:].contiguous()
-                                q_mem = torch.softmax(out_mem.float() / args.temperature, dim=1)  # B_mem x K, fp32更稳
-                                q_mem = q_mem.to(out.dtype)
+                                B_mem = out.size(0) - bs_new
+                                if B_mem > 0:
+                                    # 几何中性分布：用当前 new 的平均 Q
+                                    proto_mean = q_new.mean(dim=0, keepdim=True)   # (1, K)
+                                    q_mem = proto_mean.repeat(B_mem, 1).to(out.dtype)
 
                             # ---- 3) 拼回一个完整 batch 的 q，供后面 loss 用 ----
                             q = torch.cat([q_new, q_mem], dim=0)
@@ -1497,7 +1500,14 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
             scaler.update()
 
             # ---- after_step should be AFTER optimizer.step ----
-            hessian_tracker.after_step(task, epoch, it, model,classids=classids)
+            inputsmall_1, inputsmall_2 = inputs
+            inputsmall_1 = inputsmall_1[:32]
+            inputsmall_2 = inputsmall_2[:32]
+            # if epoch in [1,4] and it in [15]:
+            #     del loss
+            #     torch.cuda.empty_cache()
+
+            hessian_tracker.after_step(task, epoch, it, model,classids=classids,current_batch=(inputsmall_1,inputsmall_2))
 
 
         else:
