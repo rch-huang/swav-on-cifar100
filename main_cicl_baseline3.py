@@ -59,7 +59,7 @@ parser.add_argument("--queue_cleared_each_task", type=bool_flag, default=False)
 #### optim parameters ###
 #########################
 parser.add_argument("--dataset", default="cifar100", type=str, choices=["cifar100","tinyimagenet","food101"])    
-parser.add_argument("--epochs", default=100, type=int)
+parser.add_argument("--epochs", default=120, type=int)
 parser.add_argument("--batch_size", default=256, type=int)
 parser.add_argument("--base_lr", default=0.05, type=float)
 parser.add_argument("--final_lr", type=float, default=0)
@@ -1507,7 +1507,7 @@ def train(train_loader, model, optimizer,scaler,task,_task, epoch, lr_schedule, 
             #     del loss
             #     torch.cuda.empty_cache()
 
-            hessian_tracker.after_step(task, epoch, it, model,classids=classids,current_batch=(inputsmall_1,inputsmall_2))
+            hessian_tracker.after_step(task, epoch, it, model,classids=classids,current_batch=[inputsmall_1,inputsmall_2])
 
 
         else:

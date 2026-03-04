@@ -265,6 +265,10 @@ class HessianEnergyTrackerSwAV:
         # in __init__
         self._beta_anchor = None  # dict or None
         self._beta_steps_per_epoch = 19  # default; if yours is different, overwrite externally once
+        self._anchor_g_buf = []
+        self._anchor_Tg_buf = []
+        self._anchor_diag_g2_buf = []
+        self._anchor_Mii_buf = []
         _ensure_dir(self.save_root)
 
     # -------------------------
@@ -753,7 +757,7 @@ class HessianEnergyTrackerSwAV:
 
         return {"ok": True, "saved": True, "task": int(task), "epoch": int(epoch), "step": int(step)}
 
-    def compute_Mtheta_spectrum_from_anchor(
+    def compute_Mtheta_spectrum_from_anchor2(
         self,
         *,
         model,
@@ -761,138 +765,230 @@ class HessianEnergyTrackerSwAV:
         task: int,
         epoch: int,
         step: int,
-        K_big: int = 20,
-        lanczos_iter: int = 40,
+        r: int=20,
+        K_big: int = 200,
+        lanczos_iter: int = 30,
+        eta: float = 1.0,
+        eps: float = 1e-12,
     ):
-        """
-        Compute top-K_big eigenpairs of M = T^T H T
-        and store μ_k = (u_k^T g)^2
-
-        All T and H are evaluated at anchor θ.
-        """
-        import torch
+        import os, json
         import numpy as np
+        import torch
+
+        if not hasattr(self, "_mtheta_anchor") or self._mtheta_anchor is None:
+            return {"ok": False, "reason": "missing_anchor"}
 
         device = self.device if self.device is not None else next(model.parameters()).device
-
-        # -----------------------
-        # swap to anchor params
-        # -----------------------
+        def _restore_params_cpu(params, backups):
+            with torch.no_grad():
+                for p, old in zip(params, backups):
+                    p.copy_(old.to(device=p.device, dtype=p.dtype))
+        # -----------------------------
+        # swap to anchor
+        # -----------------------------
         A = self._mtheta_anchor
-        self._swap_to_anchor(model)
+        theta_anchor = A["theta_flat_cpu"]
+        C_anchor = A["C_flat_cpu"]
+        bn_anchor = A.get("bn_state_cpu", None)
 
-        # -----------------------
-        # compute g at anchor
-        # -----------------------
-        g_vec = self._compute_g_at_anchor(model, current_batch)  # [K]
+        split = _split_named_params(model)
+        theta_params = split["theta"]
+        C_params = split["C"]
 
-        # -----------------------
-        # build H graph once
-        # -----------------------
-        loss_anchor, _ = self._probe_loss_swav(
-            model,
-            probe_batches=A["probe_batches_for_hessian"],
-            epoch_for_sinkhorn=A["epoch_for_sinkhorn_hessian"],
-            require_grad=True,
-        )
-        theta_params = _split_named_params(model)["theta"]
-        grads = torch.autograd.grad(loss_anchor, theta_params, create_graph=True)
-        gflat = torch.cat([g.reshape(-1) for g in grads])
+        theta_backup = [p.detach().cpu().clone() for p in theta_params]
+        C_backup = [p.detach().cpu().clone() for p in C_params]
+        bn_backup = self._capture_bn_state_cpu(model)
+        was_training = model.training
 
-        def hvp(delta):
-            hv = torch.autograd.grad(gflat @ delta, theta_params, retain_graph=True)
-            return torch.cat([h.reshape(-1) for h in hv]).detach()
+        def _assign(params, flat_cpu):
+            flat = flat_cpu.to(device=params[0].device)
+            offset = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel()
+                    p.copy_(flat[offset:offset+n].view_as(p))
+                    offset += n
 
-        # -----------------------
-        # define M matvec
-        # -----------------------
-        def M_matvec(v_proto):
-            # 1) Tv
-            v_theta = self._T_theta_apply_anchor(model, current_batch, v_proto)
+        try:
+            _assign(theta_params, theta_anchor)
+            _assign(C_params, C_anchor)
+            if bn_anchor is not None:
+                self._restore_bn_state_(model, bn_anchor)
 
-            # 2) H Tv
-            h_theta = hvp(v_theta)
+            # =============================
+            # compute g at anchor
+            # =============================
+            inputs =  current_batch 
+            _freeze_bn_stats(model)
+            emb, out = model(inputs)
 
-            # 3) T^T h
-            K = v_proto.shape[0]
-            result = torch.zeros(K, device=device)
+            if isinstance(out, list):
+                out = out[self.prototypes_head_index]
 
-            for i in range(K):
-                e_i = torch.zeros_like(v_proto)
-                e_i[i] = 1.0
-                v_i = self._T_theta_apply_anchor(model, current_batch, e_i)
-                result[i] = torch.dot(v_i, h_theta)
+            bs = inputs[0].shape[0]
+            out_crop = out[:bs]
+            z_crop = emb[0] if isinstance(emb, (list, tuple)) else emb
 
-            return result
+            with torch.no_grad():
+                q_res = self.sinkhorn_fn(
+                    out_crop.detach(),
+                    tracker=None,
+                    clamp_min=self.clamp_min,
+                    epoch=int(epoch),
+                    total_epoch=self.total_epoch,
+                )
+                q = q_res[0] if isinstance(q_res, (tuple, list)) else q_res
+                q = q[-bs:]
 
-        # -----------------------
-        # Lanczos
-        # -----------------------
-        K = g_vec.shape[0]
-        Q = []
-        alphas = []
-        betas = []
+            p = torch.softmax(out_crop / float(self.temperature), dim=1)
+            g_vec = (p - q).mean(dim=0)
 
-        q = torch.randn(K, device=device)
-        q = q / q.norm()
-        Q.append(q)
+            K = g_vec.shape[0]
 
-        beta = 0
+            P = C_params[0]
+            if P.shape[0] == K:
+                Cmat = P.t()
+            else:
+                Cmat = P
 
-        for k in range(lanczos_iter):
-            z = M_matvec(Q[-1])
-            alpha = torch.dot(Q[-1], z)
-            alphas.append(alpha)
+            tau = float(self.temperature)
 
-            if k > 0:
-                z = z - beta * Q[-2]
-            z = z - alpha * Q[-1]
+            # =============================
+            # build H once
+            # =============================
+            loss_anchor, _ = self._probe_loss_swav(
+                model,
+                probe_batches=A["probe_batches_for_hessian"],
+                epoch_for_sinkhorn=A["epoch_for_sinkhorn_hessian"],
+                require_grad=True,
+            )
+            grads = torch.autograd.grad(loss_anchor, theta_params, create_graph=True)
+            gflat = torch.cat([g.reshape(-1) for g in grads])
 
-            beta = z.norm()
-            betas.append(beta)
+            def hvp(delta):
+                hv = torch.autograd.grad(gflat @ delta, theta_params, retain_graph=True)
+                return torch.cat([h.reshape(-1) for h in hv])
 
-            if beta < 1e-6:
-                break
+            # =============================
+            # define M matvec
+            # =============================
+            def matvec(v):
+                v = v.requires_grad_(True)
 
-            Q.append(z / beta)
+                Cv = (Cmat @ v) / tau
+                scalar = (z_crop * Cv.view(1, -1)).sum(dim=1).mean()
 
-        Tmat = torch.diag(torch.tensor(alphas))
-        for i in range(len(betas)-1):
-            Tmat[i, i+1] = betas[i+1]
-            Tmat[i+1, i] = betas[i+1]
+                grads_phi = torch.autograd.grad(
+                    scalar,
+                    theta_params,
+                    create_graph=True,
+                )
+                Tv = torch.cat([(-eta) * g.reshape(-1) for g in grads_phi])
 
-        eigvals, eigvecs_T = torch.linalg.eigh(Tmat)
+                h = hvp(Tv.detach())
 
-        # recover approximate eigenvectors
-        Qmat = torch.stack(Q, dim=1)
-        eigvecs = Qmat @ eigvecs_T
+                val = (Tv * h).sum()
+                Mv = torch.autograd.grad(val, v)[0]
 
-        # sort descending
-        idx = torch.argsort(eigvals, descending=True)
-        eigvals = eigvals[idx][:K_big]
-        eigvecs = eigvecs[:, idx][:, :K_big]
+                return Mv.detach()
 
-        # compute μ_k
-        mu = []
-        for k in range(K_big):
-            uk = eigvecs[:, k]
-            mu.append((torch.dot(uk, g_vec)**2).item())
+            # =============================
+            # Lanczos
+            # =============================
+            q0 = torch.randn(K, device=device)
+            q0 = q0 / (q0.norm() + eps)
 
-        # save
-        save_dir = os.path.join(self._task_root(task), "m_spectrum", f"epoch_{epoch}")
-        os.makedirs(save_dir, exist_ok=True)
+            Q = []
+            alphas = []
+            betas = []
 
-        np.savez_compressed(
-            os.path.join(save_dir, f"step_{step}.npz"),
-            eigvals=eigvals.cpu().numpy(),
-            mu=np.array(mu),
-        )
+            q_prev = None
+            q = q0
 
-        return {
-            "eigvals": eigvals.cpu().numpy(),
-            "mu": np.array(mu),
-        }
-    def compute_Mtheta_diag_and_gMg_from_anchor(
+            for _ in range(lanczos_iter):
+                Q.append(q)
+                z = matvec(q)
+                a = torch.dot(q, z)
+                alphas.append(a)
+
+                z = z - a*q
+                if q_prev is not None:
+                    z = z - betas[-1]*q_prev
+
+                b = z.norm()
+                if b < 1e-6:
+                    break
+                betas.append(b)
+
+                q_prev = q
+                q = z / (b + eps)
+
+            m_eff = len(alphas)
+            T = torch.zeros((m_eff, m_eff), device=device)
+            for i in range(m_eff):
+                T[i,i] = alphas[i]
+            for i in range(m_eff-1):
+                T[i,i+1] = betas[i]
+                T[i+1,i] = betas[i]
+
+            eigvals, eigvecs = torch.linalg.eigh(T)
+            idx = torch.argsort(eigvals, descending=True)
+            eigvals = eigvals[idx][:K_big]
+            eigvecs = eigvecs[:, idx][:,:K_big]
+
+            Qmat = torch.stack(Q, dim=1)
+            U = Qmat @ eigvecs
+
+            # =============================
+            # compute μ_k and C_r
+            # =============================
+            mu = []
+            weighted = []
+
+            for k in range(len(eigvals)):
+                uk = U[:,k]
+                proj = torch.dot(uk, g_vec)
+                mu_k = proj**2
+                mu.append(mu_k.item())
+                weighted.append((eigvals[k] * mu_k).item())
+
+            mu = np.array(mu)
+            eigvals_np = eigvals.detach().cpu().numpy()
+            weighted = np.array(weighted)
+
+            total = weighted.sum() + eps
+            C_r = weighted[:r].sum() / total
+
+            # =============================
+            # append to ONE file
+            # =============================
+            save_dir = os.path.join(self._task_root(task), "m_spectrum", f"epoch_{epoch}")
+            os.makedirs(save_dir, exist_ok=True)
+
+            log_path = os.path.join(save_dir, "spectrum_log.jsonl")
+
+            with open(log_path, "a") as f:
+                json.dump({
+                    "step": int(step),
+                    "eigvals": eigvals_np.tolist(),
+                    "mu": mu.tolist(),
+                    "C_r": float(C_r),
+                    "r": int(r),
+                    "K_big": int(K_big),
+                }, f)
+                f.write("\n")
+
+            return {
+                "ok": True,
+                "C_r": float(C_r),
+            }
+        
+        finally:
+            _restore_params_cpu(theta_params, theta_backup)
+            _restore_params_cpu(C_params, C_backup)
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
+    def compute_Mtheta_diag_and_gMg_from_anchor1(
         self,
         *,
         model,
@@ -1065,6 +1161,107 @@ class HessianEnergyTrackerSwAV:
             Mii_cpu = torch.empty((K,), dtype=torch.float32)
 
             diag_num = 0.0
+
+            if True:
+                def _sanity_full_Mij(
+                    *,
+                    K_small: int,
+                    g_vec: torch.Tensor,
+                    _T_theta_apply,
+                    hvp,
+                ):
+                    """
+                    Build full M in R^{K_small x K_small} where:
+                        M_ij = e_i^T (T^T H T) e_j = (T e_i)^T H (T e_j)
+                    Then verify:
+                        gMg_from_M = g^T M g
+                    and compare with gMg computed via v_g.
+                    """
+
+                    device = g_vec.device
+                    K = int(K_small)
+
+                    # ---- basis vectors in K-dim
+                    E = torch.eye(K, device=device, dtype=g_vec.dtype)  # [K,K]
+
+                    # ---- compute v_i = T(e_i) in theta-dim
+                    # Keep these (K is tiny) so we can form all pairwise M_ij.
+                    V = []
+                    for i in range(K):
+                        v_i = _T_theta_apply(E[i])  # theta-dim flat vec
+                        V.append(v_i)
+                    V = torch.stack(V, dim=0)  # [K, D_theta]
+
+                    # ---- compute Hv_j = H v_j for each j
+                    HV = []
+                    for j in range(K):
+                        Hv_j = hvp(V[j])  # theta-dim flat vec
+                        HV.append(Hv_j)
+                    HV = torch.stack(HV, dim=0)  # [K, D_theta]
+
+                    # ---- build full M: M_ij = v_i^T Hv_j
+                    # M = V @ HV^T  (since (v_i)^T (Hv_j))
+                    M = V @ HV.t()  # [K,K]
+
+                    # ---- symmetry check (numerical)
+                    sym_err = torch.norm(M - M.t(), p="fro") / (torch.norm(M, p="fro") + 1e-12)
+
+                    # ---- compute g^T M g using ONLY first K components of g
+                    gK = g_vec[:K].detach()  # [K]
+                    gMg_from_M = float((gK @ (M @ gK)).item())
+
+                    # ---- also compute diagonal-only approximation from explicit M
+                    diag_num_from_M = float(((torch.diag(M) * (gK ** 2))).sum().item())
+                    ratio_diag_from_M = diag_num_from_M / (gMg_from_M + 1e-12)
+
+                    return {
+                        "M": M.detach().cpu(),  # you can save if you want
+                        "sym_rel_fro_err": float(sym_err.item()),
+                        "gMg_from_M": gMg_from_M,
+                        "diag_num_from_M": diag_num_from_M,
+                        "ratio_diag_from_M": float(ratio_diag_from_M),
+                    }
+
+
+                # ---- trigger sanity test only when you set prototype-dim to 5
+                # (you said you'll set K=5)
+                if int(K) == 50 and epoch == 40 and False:
+                    sanity = _sanity_full_Mij(
+                        K_small=50,
+                        g_vec=g_vec,
+                        _T_theta_apply=_T_theta_apply,
+                        hvp=hvp,
+                    )
+
+                    # Compare against your existing gMg computed via v_g (already computed above)
+                    # gMg is float from: gMg = (v_g * hvp(v_g)).sum()  :contentReference[oaicite:2]{index=2}
+                    gMg_diff_abs = abs(float(gMg) - float(sanity["gMg_from_M"]))
+                    gMg_diff_rel = gMg_diff_abs / (abs(float(gMg)) + 1e-12)
+
+                    # Print / log
+                    print(
+                        f"[SanityFullM] K=50 "
+                        f"sym_rel_fro_err={sanity['sym_rel_fro_err']:.3e} "
+                        f"gMg(v_g)={float(gMg):.6e} "
+                        f"gMg(from_M)={float(sanity['gMg_from_M']):.6e} "
+                        f"abs_diff={gMg_diff_abs:.3e} rel_diff={gMg_diff_rel:.3e} "
+                        f"ratio_diag(from_M)={sanity['ratio_diag_from_M']:.3f}"
+                    )
+
+                    # Optional: save M for inspection
+                    save_dir = os.path.join(self._task_root(int(task)), "m_ii", f"epoch_{int(epoch)}")
+                    os.makedirs(save_dir, exist_ok=True)
+                    np.savez_compressed(
+                        os.path.join(save_dir, f"step_{int(step)}_fullM_K5.npz"),
+                        M=sanity["M"].numpy(),
+                        g=g_vec[:5].detach().cpu().numpy(),
+                        gMg_vg=float(gMg),
+                        gMg_from_M=float(sanity["gMg_from_M"]),
+                        sym_rel_fro_err=float(sanity["sym_rel_fro_err"]),
+                        ratio_diag_from_M=float(sanity["ratio_diag_from_M"]),
+                    )
+
+
             for i in range(K):
                 e_i = torch.zeros_like(g_vec)
                 e_i[i] = 1.0
@@ -1152,7 +1349,873 @@ class HessianEnergyTrackerSwAV:
             _restore_params_cpu(C_params, C_backup)
             self._restore_bn_state_(model, bn_backup)
             model.train(was_training)
-    
+    def compute_Mtheta_spectrum_from_anchor(
+        self,
+        *,
+        model,
+        current_batch,
+        task: int,
+        epoch: int,
+        step: int,
+        r: int=20,
+        K_big: int = 200,
+        lanczos_iter: int = 30,
+        eta: float = 1.0,
+        eps: float = 1e-12,
+    ):
+        import os, json
+        import numpy as np
+        import torch
+
+        if not hasattr(self, "_mtheta_anchor") or self._mtheta_anchor is None:
+            return {"ok": False, "reason": "missing_anchor"}
+
+        device = self.device if self.device is not None else next(model.parameters()).device
+        def _restore_params_cpu(params, backups):
+            with torch.no_grad():
+                for p, old in zip(params, backups):
+                    p.copy_(old.to(device=p.device, dtype=p.dtype))
+        # -----------------------------
+        # swap to anchor
+        # -----------------------------
+        A = self._mtheta_anchor
+        theta_anchor = A["theta_flat_cpu"]
+        C_anchor = A["C_flat_cpu"]
+        bn_anchor = A.get("bn_state_cpu", None)
+
+        split = _split_named_params(model)
+        theta_params = split["theta"]
+        C_params = split["C"]
+
+        theta_backup = [p.detach().cpu().clone() for p in theta_params]
+        C_backup = [p.detach().cpu().clone() for p in C_params]
+        bn_backup = self._capture_bn_state_cpu(model)
+        was_training = model.training
+
+        def _assign(params, flat_cpu):
+            flat = flat_cpu.to(device=params[0].device)
+            offset = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel()
+                    p.copy_(flat[offset:offset+n].view_as(p))
+                    offset += n
+
+        try:
+            _assign(theta_params, theta_anchor)
+            _assign(C_params, C_anchor)
+            if bn_anchor is not None:
+                self._restore_bn_state_(model, bn_anchor)
+
+            # =============================
+            # compute g at anchor
+            # =============================
+            inputs =  current_batch 
+            _freeze_bn_stats(model)
+            emb, out = model(inputs)
+
+            if isinstance(out, list):
+                out = out[self.prototypes_head_index]
+
+            bs = inputs[0].shape[0]
+            out_crop = out[:bs]
+            z_crop = emb[0] if isinstance(emb, (list, tuple)) else emb
+
+            with torch.no_grad():
+                q_res = self.sinkhorn_fn(
+                    out_crop.detach(),
+                    tracker=None,
+                    clamp_min=self.clamp_min,
+                    epoch=int(epoch),
+                    total_epoch=self.total_epoch,
+                )
+                q = q_res[0] if isinstance(q_res, (tuple, list)) else q_res
+                q = q[-bs:]
+
+            p = torch.softmax(out_crop / float(self.temperature), dim=1)
+            g_vec = (p - q).mean(dim=0)
+
+            # If we have multi-batch anchor stats collected, use the averaged g/Tg.
+            g_use = g_vec
+            Tg_use = None
+            if getattr(self, "_anchor_g_buf", None) is not None and len(self._anchor_g_buf) > 0:
+                stats = self.get_anchor_stats_mean(eps=eps)
+                if stats.get("ok", False) and ("g_bar" in stats) and ("Tg_bar" in stats):
+                    try:
+                        if int(stats["g_bar"].numel()) == int(g_vec.numel()):
+                            g_use = stats["g_bar"].to(device=device, dtype=g_vec.dtype)
+                            Tg_use = stats["Tg_bar"].to(device=device, dtype=torch.float32)
+                    except Exception:
+                        pass
+
+            K = g_use.shape[0]
+
+            P = C_params[0]
+            if P.shape[0] == K:
+                Cmat = P.t()
+            else:
+                Cmat = P
+
+            tau = float(self.temperature)
+
+            # =============================
+            # build H once
+            # =============================
+            loss_anchor, _ = self._probe_loss_swav(
+                model,
+                probe_batches=A["probe_batches_for_hessian"],
+                epoch_for_sinkhorn=A["epoch_for_sinkhorn_hessian"],
+                require_grad=True,
+            )
+            grads = torch.autograd.grad(loss_anchor, theta_params, create_graph=True)
+            gflat = torch.cat([g.reshape(-1) for g in grads])
+
+            def hvp(delta):
+                hv = torch.autograd.grad(gflat @ delta, theta_params, retain_graph=True)
+                return torch.cat([h.reshape(-1) for h in hv])
+
+            # =============================
+            # define M matvec
+            # =============================
+            def matvec(v):
+                v = v.requires_grad_(True)
+
+                Cv = (Cmat @ v) / tau
+                scalar = (z_crop * Cv.view(1, -1)).sum(dim=1).mean()
+
+                grads_phi = torch.autograd.grad(
+                    scalar,
+                    theta_params,
+                    create_graph=True,
+                )
+                Tv = torch.cat([(-eta) * g.reshape(-1) for g in grads_phi])
+
+                h = hvp(Tv.detach())
+
+                val = (Tv * h).sum()
+                Mv = torch.autograd.grad(val, v)[0]
+
+                return Mv.detach()
+
+            # =============================
+            # Lanczos
+            # =============================
+            q0 = torch.randn(K, device=device)
+            q0 = q0 / (q0.norm() + eps)
+
+            Q = []
+            alphas = []
+            betas = []
+
+            q_prev = None
+            q = q0
+
+            for _ in range(lanczos_iter):
+                Q.append(q)
+                z = matvec(q)
+                a = torch.dot(q, z)
+                alphas.append(a)
+
+                z = z - a*q
+                if q_prev is not None:
+                    z = z - betas[-1]*q_prev
+
+                b = z.norm()
+                if b < 1e-6:
+                    break
+                betas.append(b)
+
+                q_prev = q
+                q = z / (b + eps)
+
+            m_eff = len(alphas)
+            T = torch.zeros((m_eff, m_eff), device=device)
+            for i in range(m_eff):
+                T[i,i] = alphas[i]
+            for i in range(m_eff-1):
+                T[i,i+1] = betas[i]
+                T[i+1,i] = betas[i]
+
+            eigvals, eigvecs = torch.linalg.eigh(T)
+            idx = torch.argsort(eigvals, descending=True)
+            eigvals = eigvals[idx][:K_big]
+            eigvecs = eigvecs[:, idx][:,:K_big]
+
+            Qmat = torch.stack(Q, dim=1)
+            U = Qmat @ eigvecs
+
+            # =============================
+            # compute μ_k and C_r
+            # =============================
+            mu = []
+            weighted = []
+
+            for k in range(len(eigvals)):
+                uk = U[:,k]
+                proj = torch.dot(uk, g_use)
+                mu_k = proj**2
+                mu.append(mu_k.item())
+                weighted.append((eigvals[k] * mu_k).item())
+
+            mu = np.array(mu)
+            eigvals_np = eigvals.detach().cpu().numpy()
+            weighted = np.array(weighted)
+
+            # Denominator for coverage:
+            #   - If Tg_use is available (multi-batch averaging), use gMg = (Tg_bar)^T H (Tg_bar)
+            #   - Otherwise, fall back to total weighted energy in K-space (g_use^T M g_use)
+            if Tg_use is not None:
+                Hv_Tg = hvp(Tg_use.detach())
+                gMg_denom = float((Tg_use.detach() * Hv_Tg).sum().item())
+                total = gMg_denom + float(eps)
+            else:
+                total = float(weighted.sum() + eps)
+            C_r = float(weighted[:r].sum() / total)
+
+            # =============================
+            # append to ONE file
+            # =============================
+            save_dir = os.path.join(self._task_root(task), "m_spectrum", f"epoch_{epoch}")
+            os.makedirs(save_dir, exist_ok=True)
+
+            log_path = os.path.join(save_dir, "spectrum_log.jsonl")
+
+            with open(log_path, "a") as f:
+                json.dump({
+                    "step": int(step),
+                    "eigvals": eigvals_np.tolist(),
+                    "mu": mu.tolist(),
+                    "C_r": float(C_r),
+                    "r": int(r),
+                    "K_big": int(K_big),
+                }, f)
+                f.write("\n")
+
+            return {
+                "ok": True,
+                "C_r": float(C_r),
+            }
+        
+        finally:
+            _restore_params_cpu(theta_params, theta_backup)
+            _restore_params_cpu(C_params, C_backup)
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
+    def compute_Mtheta_diag_and_gMg_from_anchor(
+        self,
+        *,
+        model,
+        current_batch,
+        task: int,
+        epoch: int,
+        step: int,
+        crop_id: int = 0,
+        eta: float = 1.0,
+        eps: float = 1e-12,
+        return_M_full: bool = False,
+    ):
+        import torch
+
+        if return_M_full:
+            # Full M is not feasible for theta-dim vectors unless you drastically reduce K
+            return {"ok": False, "reason": "return_M_full_not_supported_in_streaming_mode_for_large_theta"}
+
+        if not hasattr(self, "_mtheta_anchor") or self._mtheta_anchor is None:
+            return {"ok": False, "reason": "missing_saved_anchor_call_save_Mtheta_anchor_state_first"}
+
+        device = self.device if self.device is not None else next(model.parameters()).device
+
+        def _normalize_inputs(b):
+            if isinstance(b, (tuple, list)):
+                if len(b) == 2 and torch.is_tensor(b[0]):
+                    x = b[0]
+                else:
+                    x = b
+            else:
+                x = b
+            if torch.is_tensor(x):
+                return [x]
+            return list(x)
+
+        def _assign_flat_to_params_(params, flat_cpu):
+            if len(params) == 0:
+                return
+            flat = flat_cpu.detach().to(device=params[0].device, dtype=params[0].dtype)
+            offset = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel()
+                    p.copy_(flat[offset:offset + n].view_as(p))
+                    offset += n
+            if offset != int(flat.numel()):
+                raise RuntimeError(f"[assign_flat] mismatch: used {offset}, flat has {flat.numel()}")
+
+        def _backup_params_cpu(params):
+            return [p.detach().cpu().clone() for p in params]
+
+        def _restore_params_cpu(params, backups):
+            with torch.no_grad():
+                for p, old in zip(params, backups):
+                    p.copy_(old.to(device=p.device, dtype=p.dtype))
+
+        A = self._mtheta_anchor
+        theta_anchor_cpu = A["theta_flat_cpu"]
+        C_anchor_cpu = A["C_flat_cpu"]
+        bn_anchor_cpu = A.get("bn_state_cpu", None)
+        probe_batches_for_hessian = A["probe_batches_for_hessian"]
+        epoch_for_sinkhorn_hessian = int(A["epoch_for_sinkhorn_hessian"])
+
+        split = _split_named_params(model)
+        theta_params = split["theta"]
+        C_params = split["C"]
+        if len(theta_params) == 0 or len(C_params) == 0:
+            return {"ok": False, "reason": "missing_theta_or_C_params"}
+
+        theta_backup = _backup_params_cpu(theta_params)
+        C_backup = _backup_params_cpu(C_params)
+        was_training = model.training
+        bn_backup = self._capture_bn_state_cpu(model)
+
+        try:
+            # swap to anchor params
+            _assign_flat_to_params_(theta_params, theta_anchor_cpu)
+            _assign_flat_to_params_(C_params, C_anchor_cpu)
+            if bn_anchor_cpu is not None:
+                self._restore_bn_state_(model, bn_anchor_cpu)
+
+            # ---------- Phase A: compute g at anchor params on current batch ----------
+            inputs = _normalize_inputs(current_batch)
+            nmb_crops_actual = len(inputs)
+            if crop_id >= nmb_crops_actual:
+                crop_id = 0
+
+            _freeze_bn_stats(model)
+            emb, out = model(inputs)
+            if isinstance(out, list):
+                out = out[self.prototypes_head_index]
+            z_all = emb if isinstance(emb, (list, tuple)) else [emb]
+
+            bs = inputs[0].shape[0]
+            K = out.shape[1]
+            out_crop = out[bs * crop_id: bs * (crop_id + 1)]
+            z_crop = z_all[crop_id] if crop_id < len(z_all) else z_all[0]
+            if z_crop.dim() == 1:
+                z_crop = z_crop.view(1, -1)
+
+            with torch.no_grad():
+                q_res = self.sinkhorn_fn(
+                    out_crop.detach(),
+                    tracker=None,
+                    clamp_min=self.clamp_min,
+                    epoch=int(epoch),
+                    total_epoch=self.total_epoch,
+                )
+                q = q_res[0] if isinstance(q_res, (tuple, list)) else q_res
+                q = q[-bs:].contiguous()
+
+            p = torch.softmax(out_crop / float(self.temperature), dim=1)
+            g_vec = (p - q).mean(dim=0).detach().to(device=device, dtype=torch.float32)  # [K]
+
+            # prototypes matrix [d,K]
+            P = C_params[0]
+            if P.shape[0] == K:
+                Cmat = P.t().contiguous()
+            elif P.shape[1] == K:
+                Cmat = P.contiguous()
+            else:
+                return {"ok": False, "reason": "prototypes_not_compatible_with_K", "P_shape": tuple(P.shape), "K": int(K)}
+
+            tau = float(self.temperature)
+
+            def _T_theta_apply(vK: torch.Tensor) -> torch.Tensor:
+                vK = vK.to(device=z_crop.device, dtype=z_crop.dtype)
+                Cv = (Cmat @ vK) / tau
+                scalar = (z_crop * Cv.view(1, -1)).sum(dim=1).mean()
+                grads = torch.autograd.grad(
+                    scalar, theta_params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )
+                flat = torch.cat([(-eta) * g.reshape(-1) for g in grads], dim=0)
+                return flat.detach().to(device=device, dtype=torch.float32).contiguous()
+
+            v_g_single = _T_theta_apply(g_vec)
+
+            # If we have multi-batch anchor stats collected, use averaged g/Tg and (optionally) averaged diag terms.
+            g_vec_use = g_vec
+            v_g = v_g_single
+            diag_g2_bar = None
+            Mii_bar = None
+            if getattr(self, "_anchor_g_buf", None) is not None and len(self._anchor_g_buf) > 0:
+                stats = self.get_anchor_stats_mean(eps=eps)
+                if stats.get("ok", False) and ("g_bar" in stats) and ("Tg_bar" in stats):
+                    try:
+                        if int(stats["g_bar"].numel()) == int(g_vec.numel()):
+                            g_vec_use = stats["g_bar"].to(device=device, dtype=g_vec.dtype).detach()
+                            v_g = stats["Tg_bar"].to(device=device, dtype=torch.float32).detach()
+                            diag_g2_bar = stats.get("diag_g2_bar", None)
+                            Mii_bar = stats.get("Mii_bar", None)
+                    except Exception:
+                        pass
+
+            # free big forward tensors
+            del emb, out, out_crop, z_all, p, q
+
+            # ---------- Phase B: build anchor Hessian graph ONCE ----------
+            loss_anchor, _ = self._probe_loss_swav(
+                model,
+                probe_batches=probe_batches_for_hessian,
+                epoch_for_sinkhorn=epoch_for_sinkhorn_hessian,
+                require_grad=True,
+            )
+            grads = torch.autograd.grad(loss_anchor, theta_params, create_graph=True, retain_graph=True)
+            gflat = torch.cat([g.reshape(-1) for g in grads], dim=0)
+
+            def hvp(delta_flat: torch.Tensor) -> torch.Tensor:
+                hv = torch.autograd.grad(
+                    gflat @ delta_flat,
+                    theta_params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )
+                return torch.cat([h.reshape(-1) for h in hv], dim=0).detach()
+
+            # gMg
+            Hv_g = hvp(v_g)
+            gMg = float((v_g * Hv_g).sum().item())
+
+            # ---------- Stream Mii and ratio_diag numerator ----------
+            g_cpu = g_vec.detach().cpu()
+            Mii_cpu = torch.empty((K,), dtype=torch.float32)
+
+            diag_num = 0.0
+
+            # If we collected per-batch diag(M_ii * g_i^2), use its mean directly (saves O(K) T/HVP calls here).
+            if diag_g2_bar is not None:
+                try:
+                    diag_g2_use = diag_g2_bar
+                    if hasattr(diag_g2_use, "to"):
+                        diag_g2_use = diag_g2_use.to(dtype=torch.float32)
+                    diag_num = float(diag_g2_use.sum().item())
+                    if Mii_bar is not None and hasattr(Mii_bar, "to"):
+                        Mii_cpu = Mii_bar.to(dtype=torch.float32).detach().cpu()
+                    else:
+                        Mii_cpu = None
+                except Exception:
+                    diag_g2_bar = None  # fallback to streaming compute below
+
+            if diag_g2_bar is None:
+                def _sanity_full_Mij(
+                    *,
+                    K_small: int,
+                    g_vec: torch.Tensor,
+                    _T_theta_apply,
+                    hvp,
+                ):
+                    """
+                    Build full M in R^{K_small x K_small} where:
+                        M_ij = e_i^T (T^T H T) e_j = (T e_i)^T H (T e_j)
+                    Then verify:
+                        gMg_from_M = g^T M g
+                    and compare with gMg computed via v_g.
+                    """
+
+                    device = g_vec.device
+                    K = int(K_small)
+
+                    # ---- basis vectors in K-dim
+                    E = torch.eye(K, device=device, dtype=g_vec.dtype)  # [K,K]
+
+                    # ---- compute v_i = T(e_i) in theta-dim
+                    # Keep these (K is tiny) so we can form all pairwise M_ij.
+                    V = []
+                    for i in range(K):
+                        v_i = _T_theta_apply(E[i])  # theta-dim flat vec
+                        V.append(v_i)
+                    V = torch.stack(V, dim=0)  # [K, D_theta]
+
+                    # ---- compute Hv_j = H v_j for each j
+                    HV = []
+                    for j in range(K):
+                        Hv_j = hvp(V[j])  # theta-dim flat vec
+                        HV.append(Hv_j)
+                    HV = torch.stack(HV, dim=0)  # [K, D_theta]
+
+                    # ---- build full M: M_ij = v_i^T Hv_j
+                    # M = V @ HV^T  (since (v_i)^T (Hv_j))
+                    M = V @ HV.t()  # [K,K]
+
+                    # ---- symmetry check (numerical)
+                    sym_err = torch.norm(M - M.t(), p="fro") / (torch.norm(M, p="fro") + 1e-12)
+
+                    # ---- compute g^T M g using ONLY first K components of g
+                    gK = g_vec[:K].detach()  # [K]
+                    gMg_from_M = float((gK @ (M @ gK)).item())
+
+                    # ---- also compute diagonal-only approximation from explicit M
+                    diag_num_from_M = float(((torch.diag(M) * (gK ** 2))).sum().item())
+                    ratio_diag_from_M = diag_num_from_M / (gMg_from_M + 1e-12)
+
+                    return {
+                        "M": M.detach().cpu(),  # you can save if you want
+                        "sym_rel_fro_err": float(sym_err.item()),
+                        "gMg_from_M": gMg_from_M,
+                        "diag_num_from_M": diag_num_from_M,
+                        "ratio_diag_from_M": float(ratio_diag_from_M),
+                    }
+
+
+                # ---- trigger sanity test only when you set prototype-dim to 5
+                # (you said you'll set K=5)
+                if int(K) == 50 and epoch == 40 and False:
+                    sanity = _sanity_full_Mij(
+                        K_small=50,
+                        g_vec=g_vec_use,
+                        _T_theta_apply=_T_theta_apply,
+                        hvp=hvp,
+                    )
+
+                    # Compare against your existing gMg computed via v_g (already computed above)
+                    # gMg is float from: gMg = (v_g * hvp(v_g)).sum()  :contentReference[oaicite:2]{index=2}
+                    gMg_diff_abs = abs(float(gMg) - float(sanity["gMg_from_M"]))
+                    gMg_diff_rel = gMg_diff_abs / (abs(float(gMg)) + 1e-12)
+
+                    # Print / log
+                    print(
+                        f"[SanityFullM] K=50 "
+                        f"sym_rel_fro_err={sanity['sym_rel_fro_err']:.3e} "
+                        f"gMg(v_g)={float(gMg):.6e} "
+                        f"gMg(from_M)={float(sanity['gMg_from_M']):.6e} "
+                        f"abs_diff={gMg_diff_abs:.3e} rel_diff={gMg_diff_rel:.3e} "
+                        f"ratio_diag(from_M)={sanity['ratio_diag_from_M']:.3f}"
+                    )
+
+                    # Optional: save M for inspection
+                    save_dir = os.path.join(self._task_root(int(task)), "m_ii", f"epoch_{int(epoch)}")
+                    os.makedirs(save_dir, exist_ok=True)
+                    np.savez_compressed(
+                        os.path.join(save_dir, f"step_{int(step)}_fullM_K5.npz"),
+                        M=sanity["M"].numpy(),
+                        g=g_vec[:5].detach().cpu().numpy(),
+                        gMg_vg=float(gMg),
+                        gMg_from_M=float(sanity["gMg_from_M"]),
+                        sym_rel_fro_err=float(sanity["sym_rel_fro_err"]),
+                        ratio_diag_from_M=float(sanity["ratio_diag_from_M"]),
+                    )
+
+
+            for i in range(K):
+                e_i = torch.zeros_like(g_vec)
+                e_i[i] = 1.0
+                v_i = _T_theta_apply(e_i)      # theta-dim vec (do NOT store)
+                Hv_i = hvp(v_i)                # theta-dim vec (do NOT store)
+                Mii = float((v_i * Hv_i).sum().item())
+                Mii_cpu[i] = Mii
+                diag_num += Mii * float(g_cpu[i].item() ** 2)
+
+                # aggressively free per-i temps
+                del e_i, v_i, Hv_i
+
+            denom = gMg + float(eps)
+            ratio_diag = float(diag_num / denom)
+
+            # If Mii_cpu is not available (e.g., diag_g2_bar provided without Mii_bar),
+            # estimate it for logging/return purposes.
+            if Mii_cpu is None:
+                g2 = (g_cpu ** 2) + float(eps)
+                Mii_cpu = (diag_g2_use.detach().cpu() / g2).to(dtype=torch.float32)
+
+            del z_crop, Cmat
+            # cleanup graph refs
+            del loss_anchor, grads, gflat
+            # (optional) help allocator
+            torch.cuda.empty_cache()
+            if True:
+                 
+
+                
+                t = int(task)
+                e = int(epoch)
+                s = int(step)
+
+                save_dir = os.path.join(self._task_root(t), "m_ii", f"epoch_{e}")
+                os.makedirs(save_dir, exist_ok=True)
+
+                # -----------------------------
+                # 1️⃣ 保存完整向量为 npz
+                # -----------------------------
+                np.savez_compressed(
+                    os.path.join(save_dir, f"step_{s}.npz"),
+                    g=g_cpu.numpy(),
+                    Mii=Mii_cpu.numpy(),
+                    Mii_g2=(Mii_cpu * (g_cpu ** 2)).numpy(),
+                    gMg=float(gMg),
+                    ratio_diag=float(ratio_diag),
+                    diag_num=float(diag_num),
+                )
+
+                # -----------------------------
+                # 2️⃣ 所有 step 共享一个 summary 文件
+                # -----------------------------
+                summary_path = os.path.join(save_dir, "mii_log.jsonl")
+
+                with open(summary_path, "a") as f:
+                    json.dump(
+                        {
+                            "task": t,
+                            "epoch": e,
+                            "step": s,
+                            "anchor_task": int(A["task"]),
+                            "anchor_epoch": int(A["epoch"]),
+                            "anchor_step": int(A["step"]),
+                            "gMg": float(gMg),
+                            "ratio_diag": float(ratio_diag),
+                            "diag_num": float(diag_num),
+                        },
+                        f
+                    )
+                    f.write("\n")
+            return {
+                "ok": True,
+                "task": int(task),
+                "epoch": int(epoch),
+                "step": int(step),
+                "anchor_task": int(A["task"]),
+                "anchor_epoch": int(A["epoch"]),
+                "anchor_step": int(A["step"]),
+                "K": int(K),
+                "g": g_cpu.numpy(),
+                "Mii": Mii_cpu.numpy(),
+                "Mii_g2": (Mii_cpu * (g_cpu ** 2)).numpy(),
+                "gMg": float(gMg),
+                "ratio_diag": float(ratio_diag),
+                "diag_num": float(diag_num),
+                "M_full": None,
+            }
+
+        finally:
+            _restore_params_cpu(theta_params, theta_backup)
+            _restore_params_cpu(C_params, C_backup)
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
+    def collect_Mtheta_anchor_stats_from_anchor(
+        self,
+        *,
+        model,
+        current_batch,
+        task: int,
+        epoch: int,
+        step: int,
+        crop_id: int = 0,
+        eta: float = 1.0,
+        eps: float = 1e-12,
+        collect_diag: bool = True,
+    ):
+        """
+        Collect anchor-evaluated statistics on *current_batch* (multi-batch averaging).
+
+        This function:
+          - swaps model to saved anchor (theta, C, and optional BN)
+          - computes g_vec on current batch at anchor params
+          - computes Tg = T_theta(g_vec) at anchor params on current batch
+          - optionally computes diag_g2 vector where diag_g2[i] = M_ii * g_i^2
+            with M_ii = (T e_i)^T H (T e_i), and H is the anchor Hessian defined by probe_batches_for_hessian.
+
+        Notes:
+          - collect_diag=True is expensive: O(K) applications of T and HVP per call.
+          - This is intended for short windows (e.g., 5~10 batches).
+        """
+        import torch
+
+        if not hasattr(self, "_mtheta_anchor") or self._mtheta_anchor is None:
+            return {"ok": False, "reason": "missing_saved_anchor_call_save_Mtheta_anchor_state_first"}
+
+        device = self.device if self.device is not None else next(model.parameters()).device
+
+        def _normalize_inputs(b):
+            if isinstance(b, (tuple, list)):
+                if len(b) == 2 and torch.is_tensor(b[0]):
+                    x = b[0]
+                else:
+                    x = b
+            else:
+                x = b
+            if torch.is_tensor(x):
+                return [x]
+            return list(x)
+
+        def _assign_flat_to_params_(params, flat_cpu):
+            if len(params) == 0:
+                return
+            flat = flat_cpu.detach().to(device=params[0].device, dtype=params[0].dtype)
+            offset = 0
+            with torch.no_grad():
+                for p in params:
+                    n = p.numel()
+                    p.copy_(flat[offset:offset + n].view_as(p))
+                    offset += n
+            if offset != int(flat.numel()):
+                raise RuntimeError(f"[assign_flat] mismatch: used {offset}, flat has {flat.numel()}")
+
+        def _backup_params_cpu(params):
+            return [p.detach().cpu().clone() for p in params]
+
+        def _restore_params_cpu(params, backups):
+            with torch.no_grad():
+                for p, old in zip(params, backups):
+                    p.copy_(old.to(device=p.device, dtype=p.dtype))
+
+        A = self._mtheta_anchor
+        theta_anchor_cpu = A["theta_flat_cpu"]
+        C_anchor_cpu = A["C_flat_cpu"]
+        bn_anchor_cpu = A.get("bn_state_cpu", None)
+        probe_batches_for_hessian = A["probe_batches_for_hessian"]
+        epoch_for_sinkhorn_hessian = int(A["epoch_for_sinkhorn_hessian"])
+
+        split = _split_named_params(model)
+        theta_params = split["theta"]
+        C_params = split["C"]
+        if len(theta_params) == 0 or len(C_params) == 0:
+            return {"ok": False, "reason": "missing_theta_or_C_params"}
+
+        theta_backup = _backup_params_cpu(theta_params)
+        C_backup = _backup_params_cpu(C_params)
+        was_training = model.training
+        bn_backup = self._capture_bn_state_cpu(model)
+
+        try:
+            # swap to anchor params
+            _assign_flat_to_params_(theta_params, theta_anchor_cpu)
+            _assign_flat_to_params_(C_params, C_anchor_cpu)
+            if bn_anchor_cpu is not None:
+                self._restore_bn_state_(model, bn_anchor_cpu)
+
+            # ---------- Phase A: compute g at anchor params on current batch ----------
+            inputs = _normalize_inputs(current_batch)
+            nmb_crops_actual = len(inputs)
+            if crop_id >= nmb_crops_actual:
+                crop_id = 0
+
+            _freeze_bn_stats(model)
+            emb, out = model(inputs)
+            if isinstance(out, list):
+                out = out[self.prototypes_head_index]
+            z_all = emb if isinstance(emb, (list, tuple)) else [emb]
+
+            bs = inputs[0].shape[0]
+            K = out.shape[1]
+            out_crop = out[bs * crop_id: bs * (crop_id + 1)]
+            z_crop = z_all[crop_id] if crop_id < len(z_all) else z_all[0]
+            if z_crop.dim() == 1:
+                z_crop = z_crop.view(1, -1)
+
+            with torch.no_grad():
+                q_res = self.sinkhorn_fn(
+                    out_crop.detach(),
+                    tracker=None,
+                    clamp_min=self.clamp_min,
+                    epoch=int(epoch),
+                    total_epoch=self.total_epoch,
+                )
+                q = q_res[0] if isinstance(q_res, (tuple, list)) else q_res
+                q = q[-bs:].contiguous()
+
+            p = torch.softmax(out_crop / float(self.temperature), dim=1)
+            g_vec = (p - q).mean(dim=0).detach().to(device=device, dtype=torch.float32).contiguous()  # [K]
+
+            # prototypes matrix [d,K]
+            P = C_params[0]
+            if P.shape[0] == K:
+                Cmat = P.t().contiguous()
+            elif P.shape[1] == K:
+                Cmat = P.contiguous()
+            else:
+                return {"ok": False, "reason": "prototypes_not_compatible_with_K", "P_shape": tuple(P.shape), "K": int(K)}
+
+            tau = float(self.temperature)
+
+            def _T_theta_apply(vK: torch.Tensor) -> torch.Tensor:
+                vK = vK.to(device=z_crop.device, dtype=z_crop.dtype)
+                Cv = (Cmat @ vK) / tau
+                scalar = (z_crop * Cv.view(1, -1)).sum(dim=1).mean()
+                grads = torch.autograd.grad(
+                    scalar, theta_params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )
+                flat = torch.cat([(-eta) * g.reshape(-1) for g in grads], dim=0)
+                return flat.detach().to(device=device, dtype=torch.float32).contiguous()
+
+            v_g = _T_theta_apply(g_vec)  # theta-dim
+
+            # store g and Tg
+            self._anchor_g_buf.append(g_vec.detach().cpu())
+            self._anchor_Tg_buf.append(v_g.detach().cpu())
+
+            # optionally collect diag contributions
+            diag_g2_cpu = None
+            Mii_cpu = None
+            if collect_diag:
+                # Build anchor Hessian graph
+                loss_anchor, _ = self._probe_loss_swav(
+                    model,
+                    probe_batches=probe_batches_for_hessian,
+                    epoch_for_sinkhorn=epoch_for_sinkhorn_hessian,
+                    require_grad=True,
+                )
+                grads = torch.autograd.grad(loss_anchor, theta_params, create_graph=True, retain_graph=True)
+                gflat = torch.cat([g.reshape(-1) for g in grads], dim=0)
+
+                def hvp(delta_flat: torch.Tensor) -> torch.Tensor:
+                    hv = torch.autograd.grad(
+                        gflat @ delta_flat,
+                        theta_params,
+                        retain_graph=True,
+                        create_graph=False,
+                        allow_unused=False,
+                    )
+                    return torch.cat([h.reshape(-1) for h in hv], dim=0).detach()
+
+                g_cpu = g_vec.detach().cpu()
+                Mii_cpu = torch.empty((K,), dtype=torch.float32)
+                diag_g2_cpu = torch.empty((K,), dtype=torch.float32)
+
+                # compute M_ii and diag contribution for this batch
+                for i in range(K):
+                    e_i = torch.zeros((K,), device=device, dtype=g_vec.dtype)
+                    e_i[i] = 1.0
+                    v_i = _T_theta_apply(e_i)      # theta-dim vec
+                    Hv_i = hvp(v_i)                # theta-dim vec
+                    Mii = float((v_i * Hv_i).sum().item())
+                    Mii_cpu[i] = Mii
+                    diag_g2_cpu[i] = Mii * float(g_cpu[i].item() ** 2)
+                    del e_i, v_i, Hv_i
+
+                self._anchor_diag_g2_buf.append(diag_g2_cpu)
+                self._anchor_Mii_buf.append(Mii_cpu)
+
+                # free graph refs
+                del loss_anchor, grads, gflat
+                torch.cuda.empty_cache()
+
+            return {
+                "ok": True,
+                "task": int(task),
+                "epoch": int(epoch),
+                "step": int(step),
+                "K": int(K),
+                "collect_diag": bool(collect_diag),
+                "n_buf": int(len(self._anchor_g_buf)),
+            }
+
+        finally:
+            _restore_params_cpu(theta_params, theta_backup)
+            _restore_params_cpu(C_params, C_backup)
+            self._restore_bn_state_(model, bn_backup)
+            model.train(was_training)
     def after_step(self, task: int, epoch: int, step: int, model,classids=[],current_batch=None) -> None:
         """
         Step-level hook.
@@ -1169,7 +2232,7 @@ class HessianEnergyTrackerSwAV:
         """
         #self.beta_anchor_and_beta_hook(task, epoch, step, model)
         if True:
-            if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,98] and step in [10]:
+            if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,115,119] and step in [10]:
                 self.save_Mtheta_anchor_state(
                     model=model,
                     anchor_batch=current_batch,   # 你实时传入的 anchor batch
@@ -1179,7 +2242,13 @@ class HessianEnergyTrackerSwAV:
                     anchor_probe_batches_for_hessian=[current_batch],  # 或者你传一组更稳定的 probe batches
                     epoch_for_sinkhorn_hessian=epoch,                 # anchor 的 sinkhorn epoch
                 )
-            if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,98] and step in [11]:
+            if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,115,119] and step in [11,12,13,14,15,16,17,18]:
+                self.collect_Mtheta_anchor_stats_from_anchor(
+                        model=model, current_batch=current_batch,
+                        task=task, epoch=epoch, step=step,
+                        collect_diag=False,   # 便宜
+                    )
+            if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,115,119] and step in [19]:
                 ratio_diag = self.compute_Mtheta_diag_and_gMg_from_anchor(
                     model=model,
                     current_batch=current_batch,
@@ -1190,16 +2259,37 @@ class HessianEnergyTrackerSwAV:
                     eta=1.0,
                     return_M_full=False,   # 需要 heatmap 时再开 True
                 )
-            if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,98] and step in [12]:
                 self.compute_Mtheta_spectrum_from_anchor(
                     model=model,
                     current_batch=current_batch,
                     task=task,
                     epoch=epoch,
-                    step=it,
+                    step=step,
                     K_big=250,
-                    lanczos_iter=40,
+                    lanczos_iter=250,
                 )
+                self.clear_anchor_stats_buffers()
+            # if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,115,119] and step in [11]:
+            #     ratio_diag = self.compute_Mtheta_diag_and_gMg_from_anchor(
+            #         model=model,
+            #         current_batch=current_batch,
+            #         task=task,
+            #         epoch=epoch,
+            #         step=step,
+            #         crop_id=0,
+            #         eta=1.0,
+            #         return_M_full=False,   # 需要 heatmap 时再开 True
+            #     )
+            # if epoch in [1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100,105,110,115,119] and step in [12]:
+            #     self.compute_Mtheta_spectrum_from_anchor(
+            #         model=model,
+            #         current_batch=current_batch,
+            #         task=task,
+            #         epoch=epoch,
+            #         step=step,
+            #         K_big=250,
+            #         lanczos_iter=250,
+            #     )
         
         if True:
             if task > 0 and epoch in [0,1,2,3,4] and step in [5,10,15]:
@@ -1226,7 +2316,7 @@ class HessianEnergyTrackerSwAV:
                         model=model,
                         optimal_bn_state_cpu = self._task_optimal_bn
                     )
-            if epoch == 99 and step in (8, 9, 10):
+            if epoch == 119 and step in (8, 9, 10):
                 if not hasattr(self, "_optimal_avg_buffer"):
                     # step(int) -> {block -> flat_cpu_tensor}
                     self._optimal_avg_buffer: Dict[int, Dict[str, torch.Tensor]] = {}
